@@ -52,46 +52,53 @@ class detect_faces(Node):
 		self.model = YOLO("yolov8n.pt")
 
 		self.coordPublisher = self.create_publisher(FaceCoords, "/face_coords", 10)
+		self.publishTimer = self.create_timer(1/5,self.publishFaces_callback)
+
 
 		self.faces = []
 		self.coords = [] #tukaj notri sta Point() in stevilo detekcij zanj
 		self.COUNTTHRESHOLD = 7 #za spreminjat,treba testirat
+		self.CONFIDENCETHRESHOLD = 0.5
 		self.lastSeen = []
 		self.counter= 0 #za določanje kdaj se sprozi cleanFaceList
+		#self.listProcessed = True
 
 		self.get_logger().info(f"Face detection node initialized!")
 
 	def yolo_callback(self, data):
-		self.faces = []
 
 		try:
 			cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-
-			self.get_logger().info(f"Running inference on image...")
-
-			# run inference
+			self.get_logger().debug(f"Running inference on image...")
 			res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
+			if len(res) == 0:
+				return
 
-			# iterate over results
-			for x in res:
-				boxes = x.boxes
-				if boxes.xyxy.nelement() == 0:
-					continue
-				bestIx = boxes.conf.argmax() #vzame bbox z najbolj samozavestno detekcijo
-				bbox = boxes.xyxy[bestIx]
+			boxes = res[0].boxes
+			if boxes.xyxy.nelement() == 0:
+				return
 
-				# draw rectangle
-				cv_image = cv2.rectangle(cv_image, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), self.detection_color, 3)
+			best_bbox = None
+			best_center = None
+			bestConf = 0.0
+			for i in range(len(boxes)):
+				confidence = boxes.conf[i]
+				if confidence > self.CONFIDENCETHRESHOLD:
+					vertices = boxes.xyxy[i]
+					cx = int(((vertices[0]+vertices[2])/2))
+					cy = int(((vertices[1]+vertices[3])/2))
+					self.faces.append((cx,cy))
+					if confidence > bestConf:
+						bestConf = confidence
+						best_bbox = vertices
+						best_center = (cx, cy)
+					
+			#VIZUALIZACIJA NAJBOLJSE DETEKCIJE
+			if best_bbox != None:
+				cv_image = cv2.rectangle(cv_image, (int(best_bbox[0]), int(best_bbox[1])), (int(best_bbox[2]), int(best_bbox[3])), self.detection_color, 3)
+				cv_image = cv2.circle(cv_image, best_center, 5, self.detection_color, -1)
+				cv2.imshow("image", cv_image)
 
-				cx = int((bbox[0]+bbox[2])/2)
-				cy = int((bbox[1]+bbox[3])/2)
-
-				# draw the center of bounding box
-				cv_image = cv2.circle(cv_image, (cx,cy), 5, self.detection_color, -1)
-
-				self.faces.append((cx,cy))
-
-			cv2.imshow("image", cv_image)
 			key = cv2.waitKey(1)
 			if key==27:
 				print("exiting")
@@ -105,17 +112,14 @@ class detect_faces(Node):
 		# get point cloud attributes
 		height = data.height
 		width = data.width
-
 		# get 3-channel representation of the point cloud in numpy format once per callback
 		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
 		a = a.reshape((height, width, 3))
 
-		# iterate over face coordinates
+	
 		for cx,cy in self.faces:
 			if cx < 0 or cy < 0 or cx >= width or cy >= height:
 				continue
-
-			# read center coordinates
 			d = a[cy,cx,:]
 			if np.isnan(d).any(): #ce kaksen NaN continue
 				continue
@@ -144,8 +148,8 @@ class detect_faces(Node):
 		if self.counter >= 30:
 			self.counter = 0
 			self.cleanFaceList()
-		self.publishFaces()
 		self.counter += 1
+		self.faces.clear() #ko obdelas vse detekcije sprazni list, drugace memleak
 		
 
 	def baseLink2Map(self, data):
@@ -181,7 +185,7 @@ class detect_faces(Node):
 			offset += 1
 
 
-	def publishFaces(self):
+	def publishFaces_callback(self):
 		pub = FaceCoords()
 		for face,count in self.coords:
 			if count >= self.COUNTTHRESHOLD:
