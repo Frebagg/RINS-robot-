@@ -140,7 +140,15 @@ class RingDetector(Node):
             if not (0 <= cx < w and 0 <= cy < h):
                 continue
             
-            center = self.latest_depth[int(cy), int(cx)] #((center_x, center_y), (axis1, axis2), angle) , numpy ma [y,x]
+            #center = self.latest_depth[int(cy), int(cx)] #((center_x, center_y), (axis1, axis2), angle) , numpy ma [y,x] #easy verzija
+            
+            patch = self.latest_depth[(cy-2):(cy+3),(cx-2):(cx+3)] #5x5 pixel del za sredino
+            vals = patch[np.isfinite(patch)]
+            #vals = vals[(vals > self.min_valid_depth) & (vals < self.max_valid_depth)]
+
+            if len(vals) == 0:
+                continue
+            center = int(np.median(vals)) # avg?
             
             if self.is_valid_depth(center): # not?
                 continue
