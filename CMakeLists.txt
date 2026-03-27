@@ -29,9 +29,6 @@ install(PROGRAMS
   src/detect_rings.py
   src/visualiser.py
   src/speech_servicer.py
-  scripts/detect_people.py
-  scripts/extract_color_from_pointcloud.py
-  scripts/robot_commander.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
