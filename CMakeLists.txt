@@ -11,6 +11,7 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceCoords.msg"
+  "msg/RingCoords.msg"
   "srv/Speech.srv"
   DEPENDENCIES geometry_msgs
 )

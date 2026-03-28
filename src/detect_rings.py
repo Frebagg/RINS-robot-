@@ -2,29 +2,38 @@
 
 import rclpy
 from rclpy.node import Node
-import cv2
+import cv2, math
 import numpy as np
 import tf2_ros
 
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import PointStamped, Vector3, Pose
+from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs_py import point_cloud2 as pc2
+from rins_robot.msg import RingCoords
+from geometry_msgs.msg import PointStamped, Vector3, Pose, Point
 from cv_bridge import CvBridge, CvBridgeError
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
+
+import tf2_geometry_msgs as tfg
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from rclpy.duration import Duration
 
 qos_profile = QoSProfile(
-    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-    reliability=QoSReliabilityPolicy.RELIABLE,
-    history=QoSHistoryPolicy.KEEP_LAST,
-    depth=1
-)
-
+          durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+          reliability=QoSReliabilityPolicy.RELIABLE,
+          history=QoSHistoryPolicy.KEEP_LAST,
+          depth=1)
 
 class RingDetector(Node):
     def __init__(self):
         super().__init__('transform_point')
+
+        # Basic ROS stuff
+        timer_frequency = 5
+        timer_period = 1/timer_frequency
 
         # ellipse thresholds
         self.ecc_thr = 100
@@ -36,33 +45,213 @@ class RingDetector(Node):
         self.depth_thr = 0.10
         self.min_valid_depth = 0.05
         self.max_valid_depth = 5.0
+
+        # direct threshold on depth image (in meters)
+        self.binary_depth_min = 0.5
+        self.binary_depth_max = 3.5
+
+        # ring validation
+        self.inner_scale = 0.45
         self.min_ring_depth_points = 12
         self.min_center_depth_points = 8
 
-        # inner ellipse scale for "hole" check
-        self.inner_scale = 0.45
+        # merging detections into ring table
+        self.merge_distance_xy = 0.5
+        self.merge_distance_z = 0.5
 
-        # threshold for depth gray image
-        self.depth_binary_threshold = 60
+        # tf + pointcloud
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.pointcloud_sub = self.create_subscription(
+            PointCloud2,
+            "/oakd/rgb/preview/depth/points",
+            self.checkRing_callback,
+            qos_profile_sensor_data
+        )
+
+        # ring table publisher
+        self.coordPublisher = self.create_publisher(RingCoords, "/ring_coords", 10)
+        self.publishTimer = self.create_timer(1/5, self.publishRings_callback)
+
+        # variables for ring tracking
+        self.rings_2d = []      # (cx, cy, color)
+        self.coords = []        # (id, Point(), color)
+        self.nextRingId = 1
 
         # bridge
         self.bridge = CvBridge()
 
-        # subscribers
-        self.image_sub = self.create_subscription(
-            Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1
-        )
-        self.depth_sub = self.create_subscription(
-            Image, "/oakd/rgb/preview/depth", self.depth_callback, 1
-        )
+        # Subscribe to the image and/or depth topic
+        self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
+        self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
 
         cv2.namedWindow("Binary Image", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)
 
+    def image_callback(self, data):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            print(e)
+            return
+
+        if self.latest_depth is None:
+            cv2.imshow("Detected rings", cv_image)
+            cv2.waitKey(1)
+            return
+
+        depth = self.latest_depth.copy()
+
+        if cv_image.shape[:2] != depth.shape[:2]:
+            print("RGB and depth image shapes do not match")
+            return
+
+        # clear detections from previous frame
+        self.rings_2d.clear()
+
+        # Binarize the depth image directly using depth values in meters
+        valid = np.isfinite(depth)
+        valid = valid & (depth > self.min_valid_depth) & (depth < self.max_valid_depth)
+
+        thresh = np.zeros(depth.shape, dtype=np.uint8)
+        thresh[valid & (depth > self.binary_depth_min) & (depth < self.binary_depth_max)] = 255
+
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        cv2.imshow("Binary Image", thresh)
+
+        # Extract contours
+        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Example of how to draw the contours, only for visualization purposes
+        contour_vis = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(contour_vis, contours, -1, (255, 0, 0), 1)
+        cv2.imshow("Detected contours", contour_vis)
+
+        # Fit elipses to all extracted contours
+        elps = []
+        for cnt in contours:
+            if cnt.shape[0] >= self.min_contour_points:
+                ellipse = cv2.fitEllipse(cnt)
+
+                # filter ellipses that are too eccentric
+                e = ellipse[1]
+                ecc1 = e[0]
+                ecc2 = e[1]
+
+                if ecc1 <= 0 or ecc2 <= 0:
+                    continue
+
+                ratio = ecc1/ecc2 if ecc1 > ecc2 else ecc2/ecc1
+                if ratio <= self.ratio_thr and ecc1 < self.ecc_thr and ecc2 < self.ecc_thr:
+                    elps.append(ellipse)
+
+        vis = cv_image.copy()
+        candidates = []
+
+        # Check each ellipse individually
+        for ellipse in elps:
+            # display candidates
+            cv2.ellipse(vis, ellipse, (255, 255, 0), 1)
+            cv2.circle(vis, (int(ellipse[0][0]), int(ellipse[0][1])), 1, (255, 255, 0), -1)
+
+            is_ring, inner_ellipse = self.ellipse_is_ring(depth, ellipse)
+
+            if not is_ring:
+                continue
+
+            candidates.append((ellipse, inner_ellipse))
+
+        print("Processing is done! found", len(candidates), "candidates for rings")
+
+        # Plot the rings on the image
+        for c in candidates:
+            e1 = c[0]
+            e2 = c[1]
+
+            # drawing the ellipses on the image
+            cv2.ellipse(vis, e1, (0, 255, 0), 2)
+            cv2.ellipse(vis, e2, (0, 255, 0), 1)
+
+            color_name = self.classify_ring_color(cv_image, e1)
+
+            cx = int(e1[0][0])
+            cy = int(e1[0][1])
+
+            cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
+            cv2.putText(
+                vis,
+                color_name,
+                (cx + 10, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
+
+            # save 2D detections for pointcloud callback
+            self.rings_2d.append((e1, color_name))
+
+        cv2.imshow("Detected rings", vis)
+        cv2.waitKey(1)
+        
+    def get_ring_3d_point(self, pointcloud, ellipse):
+        height, width, _ = pointcloud.shape
+
+        ring_mask, _, _ = self.make_ring_mask_from_one_ellipse(
+            (height, width), ellipse, self.inner_scale
+        )
+
+        ys, xs = np.where(ring_mask > 0)
+
+        if len(xs) == 0:
+            return None
+
+        pts = pointcloud[ys, xs, :]
+        pts = pts[np.isfinite(pts).all(axis=1)]
+
+        if len(pts) == 0:
+            return None
+
+        # odstrani skoraj ničelne točke
+        pts = pts[np.linalg.norm(pts, axis=1) > 1e-6]
+        if len(pts) == 0:
+            return None
+
+        # vzemi mediano po vseh točkah na obroču
+        d = np.median(pts, axis=0)
+
+        if not np.isfinite(d).all():
+            return None
+
+        return d
+
     def is_valid_depth(self, d):
-        return np.isfinite(d) and self.min_valid_depth < d < self.max_valid_depth
+        return np.isfinite(d) and d != 0 and self.min_valid_depth < d < self.max_valid_depth
+
+    def depth_callback(self, data):
+        try:
+            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
+        except CvBridgeError as e:
+            print(e)
+            return
+
+        depth_image = depth_image.astype(np.float32)
+        depth_image[depth_image == np.inf] = 0
+        depth_image[~np.isfinite(depth_image)] = 0
+
+        self.latest_depth = depth_image.copy()
+
+        # Do the necessary conversion so we can visualize it in OpenCV
+        image_viz = self.depth_to_gray(depth_image)
+
+        cv2.imshow("Depth window", image_viz)
+        cv2.waitKey(1)
 
     def depth_to_gray(self, depth):
         d = depth.copy().astype(np.float32)
@@ -96,53 +285,13 @@ class RingDetector(Node):
         return mask
 
     def make_ring_mask_from_one_ellipse(self, shape, ellipse, inner_scale):
-        outer_mask = self.make_filled_ellipse_mask(shape, ellipse)
+        mask_outer = self.make_filled_ellipse_mask(shape, ellipse)
+
         inner_ellipse = self.scale_ellipse(ellipse, inner_scale)
-        inner_mask = self.make_filled_ellipse_mask(shape, inner_ellipse)
-        ring_mask = cv2.subtract(outer_mask, inner_mask)
-        return ring_mask, inner_mask, inner_ellipse
+        mask_inner = self.make_filled_ellipse_mask(shape, inner_ellipse)
 
-    def classify_ring_color(self, bgr_image, ellipse):
-        ring_mask, _, _ = self.make_ring_mask_from_one_ellipse(
-            bgr_image.shape, ellipse, self.inner_scale
-        )
-
-        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-        ring_pixels = hsv[ring_mask > 0]
-
-        if len(ring_pixels) < 20:
-            return "unknown"
-
-        s = ring_pixels[:, 1]
-        v = ring_pixels[:, 2]
-        colored = ring_pixels[s > 60]
-
-        if len(colored) < 10:
-            median_v = float(np.median(v))
-            if median_v > 180:
-                return "white"
-            elif median_v < 60:
-                return "black"
-            else:
-                return "gray"
-
-        hue_vals = colored[:, 0]
-        median_h = float(np.median(hue_vals))
-
-        if median_h < 10 or median_h >= 170:
-            return "red"
-        elif median_h < 25:
-            return "orange"
-        elif median_h < 35:
-            return "yellow"
-        elif median_h < 85:
-            return "green"
-        elif median_h < 130:
-            return "blue"
-        elif median_h < 170:
-            return "purple"
-
-        return "unknown"
+        ring_mask = cv2.subtract(mask_outer, mask_inner)
+        return ring_mask, mask_inner, inner_ellipse
 
     def ellipse_is_ring(self, depth, ellipse):
         ring_mask, inner_mask, inner_ellipse = self.make_ring_mask_from_one_ellipse(
@@ -176,134 +325,152 @@ class RingDetector(Node):
 
         return False, inner_ellipse
 
-    def image_callback(self, data):
+    def classify_ring_color(self, bgr_image, ellipse):
+        ring_mask, _, _ = self.make_ring_mask_from_one_ellipse(
+            bgr_image.shape, ellipse, self.inner_scale
+        )
+
+        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+        ring_pixels = hsv[ring_mask > 0]
+
+        if len(ring_pixels) < 20:
+            return "unknown"
+
+        h = ring_pixels[:, 0]
+        s = ring_pixels[:, 1]
+        v = ring_pixels[:, 2]
+
+        # remove almost gray / white / black pixels first
+        colored = ring_pixels[s > 60]
+
+        if len(colored) < 10:
+            median_v = float(np.median(v))
+            if median_v > 180:
+                return "white"
+            elif median_v < 60:
+                return "black"
+            else:
+                return "gray"
+
+        hue_vals = colored[:, 0]
+        median_h = float(np.median(hue_vals))
+
+        # H is in range 0-179
+        if median_h < 10 or median_h >= 170:
+            return "red"
+        elif median_h < 25:
+            return "orange"
+        elif median_h < 35:
+            return "yellow"
+        elif median_h < 85:
+            return "green"
+        elif median_h < 130:
+            return "blue"
+        elif median_h < 170:
+            return "purple"
+
+        return "unknown"
+
+    def checkRing_callback(self, data):
+        height = data.height
+        width = data.width
+
+        a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
+        a = a.reshape((height, width, 3))
+
+        for ellipse, color in self.rings_2d:
+            if color == "unknown":
+                continue
+
+            d = self.get_ring_3d_point(a, ellipse)
+            if d is None:
+                continue
+
+            detection = self.baseLink2Map(d)
+            if detection is None:
+                continue
+
+            x = detection.point.x
+            y = detection.point.y
+            z = detection.point.z
+
+            if not np.isfinite([x, y, z]).all():
+                continue
+
+            print("NEW DETECTION:", color, x, y, z)
+
+            newRing = True
+
+            for i, (ring_id, ring_pt, ring_color) in enumerate(self.coords):
+                if ring_color != color:
+                    continue
+
+                print("  compare with:", ring_id, ring_color, ring_pt.x, ring_pt.y, ring_pt.z)
+
+                if (
+                    abs(ring_pt.x - x) < self.merge_distance_xy and
+                    abs(ring_pt.y - y) < self.merge_distance_xy and
+                    abs(ring_pt.z - z) < self.merge_distance_z
+                ):
+                    ring_pt.x = (ring_pt.x + x) / 2.0
+                    ring_pt.y = (ring_pt.y + y) / 2.0
+                    ring_pt.z = (ring_pt.z + z) / 2.0
+                    self.coords[i] = (ring_id, ring_pt, ring_color)
+                    print("MERGED INTO EXISTING RING", ring_id)
+                    newRing = False
+                    break
+
+            if newRing:
+                p = Point()
+                p.x = x
+                p.y = y
+                p.z = z
+                self.coords.append((self.nextRingId, p, color))
+                print("ADDED NEW RING", self.nextRingId, color, x, y, z)
+                self.nextRingId += 1
+
+        self.rings_2d.clear()
+
+    def publishRings_callback(self):
+        pub = RingCoords()
+
+        for ring_id, ring_pt, color in self.coords:
+            if not np.isfinite([ring_pt.x, ring_pt.y, ring_pt.z]).all():
+                continue
+            pub.ids.append(ring_id)
+            pub.points.append(ring_pt)
+            pub.colors.append(color)
+
+        self.coordPublisher.publish(pub)
+
+    def baseLink2Map(self, d):
+        p = PointStamped()
+        p.header.frame_id = "oakd_rgb_camera_optical_frame"
+        p.header.stamp = self.get_clock().now().to_msg()
+
+        p.point.x = float(d[0])
+        p.point.y = float(d[1])
+        p.point.z = float(d[2])
+
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-        except CvBridgeError as e:
-            print(e)
-            return
-
-        if self.latest_depth is None:
-            cv2.imshow("Detected rings", cv_image)
-            cv2.waitKey(1)
-            return
-
-        depth = self.latest_depth.copy()
-
-        if cv_image.shape[:2] != depth.shape[:2]:
-            print("RGB in depth nimata enake velikosti")
-            return
-
-        # DEPTH -> grayscale
-        depth_gray = self.depth_to_gray(depth)
-
-        # navaden threshold na depth sliki
-        _, thresh = cv2.threshold(
-            depth_gray,
-            self.depth_binary_threshold,
-            255,
-            cv2.THRESH_BINARY_INV
-        )
-
-        # če želiš adaptive threshold, lahko uporabiš to vrstico namesto zgornjih dveh:
-        # thresh = cv2.adaptiveThreshold(depth_gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 5)
-
-        kernel = np.ones((3, 3), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-        cv2.imshow("Binary Image", thresh)
-
-        contours, hierarchy = cv2.findContours(
-            thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        contour_vis = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(contour_vis, contours, -1, (255, 0, 0), 1)
-        cv2.imshow("Detected contours", contour_vis)
-
-        elps = []
-        for cnt in contours:
-            if cnt.shape[0] < self.min_contour_points:
-                continue
-
-            ellipse = cv2.fitEllipse(cnt)
-
-            e = ellipse[1]
-            ecc1 = e[0]
-            ecc2 = e[1]
-
-            if ecc1 <= 0 or ecc2 <= 0:
-                continue
-
-            ratio = ecc1 / ecc2 if ecc1 > ecc2 else ecc2 / ecc1
-
-            if ratio <= self.ratio_thr and ecc1 < self.ecc_thr and ecc2 < self.ecc_thr:
-                elps.append(ellipse)
-
-        vis = cv_image.copy()
-        candidates = []
-
-        for ellipse in elps:
-            is_ring, inner_ellipse = self.ellipse_is_ring(depth, ellipse)
-
-            cv2.ellipse(vis, ellipse, (255, 255, 0), 1)
-            cx = int(ellipse[0][0])
-            cy = int(ellipse[0][1])
-            cv2.circle(vis, (cx, cy), 1, (255, 255, 0), -1)
-
-            if not is_ring:
-                continue
-
-            candidates.append((ellipse, inner_ellipse))
-
-        print("Processing is done! found", len(candidates), "candidates for rings")
-
-        for ellipse, inner_ellipse in candidates:
-            cv2.ellipse(vis, ellipse, (0, 255, 0), 2)
-            cv2.ellipse(vis, inner_ellipse, (0, 255, 0), 1)
-
-            cx = int(ellipse[0][0])
-            cy = int(ellipse[0][1])
-
-            color_name = self.classify_ring_color(cv_image, ellipse)
-
-            cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
-            cv2.putText(
-                vis,
-                color_name,
-                (cx + 10, cy),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2
+            transform = self.tf_buffer.lookup_transform(
+                "map",
+                p.header.frame_id,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.2)
             )
-
-        cv2.imshow("Detected rings", vis)
-        cv2.waitKey(1)
-
-    def depth_callback(self, data):
-        try:
-            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
-        except CvBridgeError as e:
-            print(e)
-            return
-
-        depth_image = depth_image.astype(np.float32)
-        depth_image[depth_image == np.inf] = 0
-        depth_image[~np.isfinite(depth_image)] = 0
-
-        self.latest_depth = depth_image.copy()
-
-        image_viz = self.depth_to_gray(depth_image)
-        cv2.imshow("Depth window", image_viz)
-        cv2.waitKey(1)
+            return tfg.do_transform_point(p, transform)
+        except Exception as e:
+            print("TF transform failed:", e)
+            return None
 
 
 def main():
     rclpy.init(args=None)
     rd_node = RingDetector()
+
     rclpy.spin(rd_node)
+
     cv2.destroyAllWindows()
 
 
