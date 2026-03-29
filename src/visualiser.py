@@ -10,7 +10,7 @@ from geometry_msgs.msg import Point
 
 
 class visualizeMarkers(Node):
-    
+
     def __init__(self):
         super().__init__("visualizeMarkers")
 
@@ -75,7 +75,7 @@ class visualizeMarkers(Node):
             self.markerPublisher.publish(text)
             self.markerPublisher.publish(marker)
 
-        
+
     def manageRingMarkers_callback(self,msg):
         if len(msg.points) != len(msg.ids) or len(msg.points) != len(msg.colors):
             return
@@ -113,9 +113,9 @@ class visualizeMarkers(Node):
             text.pose.position.y = ring.y
             text.pose.position.z = ring.z + 0.5
             text.scale.z = 0.5
-            text.color.r = 1.0
-            text.color.g = 1.0
-            text.color.b = 1.0
+            text.color.r = r
+            text.color.g = g
+            text.color.b = b
             text.color.a = 1.0
             text.text = f"Ring {ring_id} ({color})"
             text.pose.orientation.w = 1.0
@@ -155,4 +155,4 @@ def main():
 	rclpy.shutdown()
 
 if __name__ == '__main__':
-	main()
+    main()

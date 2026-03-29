@@ -3,7 +3,7 @@
 <package format="3">
   <name>rins_robot</name>
   <version>0.0.0</version>
-  <description>Face detection and visualization package for RINS robot.</description>
+  <description>RINS robot package merged with dis_tutorial3 simulation assets, worlds, launch files and helper scripts.</description>
   <maintainer email="sever@todo.todo">sever</maintainer>
   <license>TODO</license>
 
@@ -14,15 +14,25 @@
 
   <exec_depend>rosidl_default_runtime</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>rclcpp</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>sensor_msgs_py</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-pyttsx3</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>irobot_create_msgs</exec_depend>
+  <exec_depend>turtle_tf2_py</exec_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>
 

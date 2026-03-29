@@ -12,16 +12,27 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceCoords.msg"
   "msg/RingCoords.msg"
+  "srv/Speech.srv"
   DEPENDENCIES geometry_msgs
+)
+
+install(DIRECTORY
+  launch
+  config
+  worlds
+  maps
+  urdf
+  DESTINATION share/${PROJECT_NAME}/
 )
 
 install(PROGRAMS
   src/face_detection.py
-  src/visualiser.py
   src/detect_rings.py
   src/speech_servicer.py
   src/robot_commander.py
   src/robot_navigator.py
+  src/visualiser.py
+  src/speech_servicer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
