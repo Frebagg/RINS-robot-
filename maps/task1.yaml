@@ -1,4 +1,4 @@
-image: map.pgm
+image: task1.pgm
 mode: trinary
 resolution: 0.05
 origin: [-2.16, -2.6, 0]

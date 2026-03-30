@@ -30,6 +30,7 @@ install(PROGRAMS
   src/detect_rings.py
   src/visualiser.py
   src/speech_servicer.py
+  src/task_executor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

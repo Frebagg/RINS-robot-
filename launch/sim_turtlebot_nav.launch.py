@@ -30,6 +30,7 @@ ARGUMENTS = [
     DeclareLaunchArgument('world', default_value='task1_yellow_demo', description='Simulation World'),
     DeclareLaunchArgument('model', default_value='standard', choices=['standard', 'lite'], description='Turtlebot4 Model'),
     DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false'], description='use_sim_time'),
+    DeclareLaunchArgument('headless', default_value='false', choices=['true', 'false'], description='Run Gazebo server-only (no GUI)'),
     DeclareLaunchArgument('map', default_value=PathJoinSubstitution([pkg_rins_robot, 'maps', 'task11.yaml']), description='Full path to map yaml file to load')
 ]
 
@@ -48,7 +49,8 @@ def generate_launch_description():
         PythonLaunchDescriptionSource([gazebo_launch]),
         launch_arguments=[
             ('world', LaunchConfiguration('world')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time'))
+            ('use_sim_time', LaunchConfiguration('use_sim_time')),
+            ('headless', LaunchConfiguration('headless')),
         ]
     )
 
