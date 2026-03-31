@@ -36,8 +36,8 @@ controller_server:
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.07
-      yaw_goal_tolerance: 0.05
+      xy_goal_tolerance: 0.3 #prej 0.07 - ucitelj sabotage
+      yaw_goal_tolerance: 0.3 #prej 0.05
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       desired_linear_vel: 0.5
@@ -152,7 +152,7 @@ global_costmap:
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 15.0 #bilo 4.0
+        cost_scaling_factor: 4.0
         inflation_radius: 0.3 #bilo 0.45
       always_send_full_costmap: true
 

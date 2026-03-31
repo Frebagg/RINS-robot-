@@ -322,8 +322,9 @@ class RobotCommander(Node):
         #najprej obrazi
         request = Speech.Request()
         request.data = "Hello, human"
-
+        ringsCopy = self.rings.copy()
         facesCopy = self.faces.copy()
+
         for point,id in facesCopy:
             self.info(f"Going towards face {id}.")
             x = point.x
@@ -348,9 +349,6 @@ class RobotCommander(Node):
             self.info("Waiting for the task to complete...")
             while not self.isTaskComplete():
                 time.sleep(1)
-
-            while not self.greetClient.wait_for_service(timeout_sec=1.0):
-                self.warn('Waiting for /greet_service...')
             
             future = self.greetClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
@@ -362,7 +360,6 @@ class RobotCommander(Node):
                 self.info("Failed to talk to a human!")
 
         #obisci ringe
-        ringsCopy = self.rings.copy()
         for point,id,color in ringsCopy:
             self.info(f"Going towards ring {id}.")
             x = point.x
@@ -388,9 +385,6 @@ class RobotCommander(Node):
             self.info("Waiting for the task to complete...")
             while not self.isTaskComplete():
                 time.sleep(1)
-
-            while not self.sayColorClient.wait_for_service(timeout_sec=1.0):
-                self.warn('Waiting for /sayColor_service...')
             
             future = self.sayColorClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
@@ -403,7 +397,7 @@ class RobotCommander(Node):
     #--------------------------------------------------------------------------
 
 def main(args=None):
-    print("Running new Commander!")
+    #print("Running new Commander!")
     rclpy.init(args=args)
     rc = RobotCommander()
 
@@ -423,18 +417,19 @@ def main(args=None):
         (1, 1.3, 1.8, 0),
         (2, 1.0, 2.3, 0),
         (3, 0.0, 2.75, 0),
-        (4, -1.0, 2.6, 0),
+        (4, -1.0, 2.5, 0),
         (5, -2.5, 2.5, 0),
-        (6, -1.8, 0.05, 0),
-        (7, -1.85, -1.2, 0),
-        (8, -1.1, -2.3, 0),
-        (9, 0.0, -1.6, 0),
-        (10, 0.0, -3.6, 0),
-        (11, 1.5, -3.5, 0),
-        (12, 1.4, -2.5, 0),
-        (13, 2.25, -1.3, 0),
-        (14, 1.35, -0.1, 0),
-        (15, -1.15, 1.3, 0)
+        (6, -2.63, 1.55, 0),
+        (7, -1.8, 0.05, 0),
+        (8, -1.85, -1.2, 0),
+        (9, -1.1, -2.3, 0),
+        (10, 0.0, -1.6, 0),
+        (11, 0.0, -3.6, 0),
+        (12, 1.5, -3.5, 0),
+        (13, 1.4, -2.5, 0),
+        (14, 2.25, -1.3, 0),
+        (15, 1.35, -0.1, 0),
+        (16, -1.15, 1.3, 0)
     ]
     
     #---------------------------------------------------------------------
