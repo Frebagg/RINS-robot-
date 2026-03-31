@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
 """
-task_executor.py — Random-waypoint patrol with detection-driven interrupts.
-
-Patrol
-------
-On receiving the first /map message, N random free-space waypoints are sampled
-and pushed onto a deque (the "linked list").  The robot works through the deque
-head-to-tail.  After arriving at each patrol waypoint it does a full 360° spin
-so it can see in all directions before moving on.
-
-Detections
-----------
-Every new FaceCoords / RingCoords detection is inserted at the FRONT of the
-deque.  If the robot is currently navigating to a patrol waypoint, that goal is
-cancelled and the interrupted patrol node is pushed back to position [1] so it
-is visited right after the detection.  Duplicate detections (within 1 m of an
-already-queued one) are ignored.
-
 Parameters
 ----------
 n_waypoints    : int   (default 25)   number of random patrol waypoints
@@ -74,16 +57,15 @@ def make_pose(frame: str, stamp, x: float, y: float, yaw: float = 0.0) -> PoseSt
 # ── waypoint node ──────────────────────────────────────────────────────────────
 
 class WaypointNode:
-    """Single node in the patrol deque / linked list."""
     __slots__ = ('x', 'y', 'spin_after', 'dtype', 'det_id', 'color')
 
     def __init__(self, x, y, spin_after=True, dtype=None, det_id=None, color=''):
         self.x          = x
         self.y          = y
-        self.spin_after = spin_after  # 360° spin on arrival (patrol nodes only)
-        self.dtype      = dtype       # None | 'face' | 'ring'
-        self.det_id     = det_id      # original detection ID (for visited tracking)
-        self.color      = color       # ring color
+        self.spin_after = spin_after  
+        self.dtype      = dtype      
+        self.det_id     = det_id     
+        self.color      = color       
 
 
 # ── main node ──────────────────────────────────────────────────────────────────
@@ -96,7 +78,6 @@ class TaskExecutor(Node):
     _SPINNING   = 'SPINNING'
     _DONE       = 'DONE'
 
-    # Detection deduplication threshold (metres)
     _DUP_DIST = 1.0
 
     def __init__(self):
@@ -107,14 +88,14 @@ class TaskExecutor(Node):
         self.declare_parameter('approach_dist',      0.8)
         self.declare_parameter('min_wall_dist',      0.5)
         self.declare_parameter('patrol_waypoints',   [0.0])
-        self.declare_parameter('area_spin_gain',     3.0)
+        
+        self.declare_parameter('area_spin_gain',     3.0) # Ce hocemo uporabljat razliko v povrsini kot pogoj za vrtenje
 
-        self._n_wp           = self.get_parameter('n_waypoints').value
-        self._approach       = self.get_parameter('approach_dist').value
-        self._min_wall       = self.get_parameter('min_wall_dist').value
+        self._n_wp          = self.get_parameter('n_waypoints').value
+        self._approach      = self.get_parameter('approach_dist').value
+        self._min_wall      = self.get_parameter('min_wall_dist').value
         self._area_spin_gain = self.get_parameter('area_spin_gain').value
 
-        # ── callback group ──────────────────────────────────────────────────────
         self._cbg = ReentrantCallbackGroup()
 
         # ── action clients ──────────────────────────────────────────────────────
@@ -123,13 +104,11 @@ class TaskExecutor(Node):
         self._spin_client = ActionClient(self, Spin, 'spin',
                                           callback_group=self._cbg)
 
-        # ── service clients ─────────────────────────────────────────────────────
         self._greet_cli = self.create_client(Speech, '/greet_service',
                                               callback_group=self._cbg)
         self._color_cli = self.create_client(Speech, '/sayColor_service',
                                               callback_group=self._cbg)
 
-        # ── subscribers ─────────────────────────────────────────────────────────
         map_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -148,22 +127,21 @@ class TaskExecutor(Node):
                                   self._on_scan, 10,
                                   callback_group=self._cbg)
 
-        # ── TF ──────────────────────────────────────────────────────────────────
         self._tf_buf      = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
 
-        # ── state ───────────────────────────────────────────────────────────────
         self._lock          = threading.Lock()
         self._state         = self._IDLE
         self._wq: deque[WaypointNode] = deque()
         self._current: Optional[WaypointNode] = None
         self._nav_handle    = None
-        self._map_done      = False
+        self._map_done      = False        
 
         self._visited_faces: set = set()
         self._visited_rings: set = set()
 
-        self._last_spin_area: float = 0.0
+        # Stvari za avtomatsko vrtenje (ne uporabljamo rn)
+        self._last_spin_area: float = 0.0  
         self._area_spin_pending: bool = False
 
         self.get_logger().info(
@@ -172,7 +150,7 @@ class TaskExecutor(Node):
         )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Map → build patrol deque
+    # Map
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_map(self, msg: OccupancyGrid):
@@ -181,10 +159,10 @@ class TaskExecutor(Node):
                 return
             self._map_done = True
 
-        self.get_logger().info('Map received — building patrol route.')
+        self.get_logger().info('Map received.')
         self._build_route(msg)
 
-        self.get_logger().info('Waiting for Nav2 action server…')
+        self.get_logger().info('Waiting for Nav2…')
         self._nav.wait_for_server()
         self.get_logger().info('Nav2 ready — starting patrol.')
         self._advance()
@@ -194,29 +172,17 @@ class TaskExecutor(Node):
                     .get_parameter_value().double_array_value)
         if len(flat) >= 2:
             pts = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)]
-            source = 'user-provided'
-        else:
-            pts = self._sample_free(msg, self._n_wp)
-            source = 'sampled'
+            for x, y in pts:
+                self._wq.append(WaypointNode(x, y, spin_after=True))
+            self.get_logger().info(f'Using {len(pts)} waypoints.')
+            return
 
-        # Optimise traversal order: nearest-neighbour from robot start + 2-opt
-        start = self._robot_xy()
-        pts = self._nearest_neighbor_order(pts, start)
-        # pts = self._two_opt(pts)
-
-        # Forward pass then reverse pass (omit the turnaround point duplicate)
-        full_route = pts + pts[-2::-1]
-
-        for x, y in full_route:
+        pts = self._sample_free(msg, self._n_wp)
+        for x, y in pts:
             self._wq.append(WaypointNode(x, y, spin_after=False))
-        self.get_logger().info(
-            f'Built patrol route: {len(pts)} {source} waypoints × 2 passes '
-            f'(NN + 2-opt ordered from {start[0]:.2f},{start[1]:.2f}), no spinning.'
-        )
+        self.get_logger().info(f'Sampled {len(pts)} random waypoints.')
 
     def _sample_free(self, msg: OccupancyGrid, n: int):
-        """Grid-based sampling: divide map into n cells, pick one free point per
-        cell.  This guarantees uniform spatial coverage instead of clustering."""
         res  = msg.info.resolution
         ox   = msg.info.origin.position.x
         oy   = msg.info.origin.position.y
@@ -246,24 +212,42 @@ class TaskExecutor(Node):
                 )
 
         if not buckets:
-            self.get_logger().warn('No free cells found — defaulting to origin.')
+            self.get_logger().warn('No free cells found')
             return [(0.0, 0.0)]
 
         pts = [random.choice(v) for v in buckets.values()]
+        random.shuffle(pts)
         return pts[:n]
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Scan area — no longer triggers spins, just tracks area
+    # Scan area
     # ══════════════════════════════════════════════════════════════════════════
 
+    # mogoce za poznejso uporabo zdaj ne rabimo
     def _on_scan(self, msg: LaserScan):
         area = self._scan_polygon_area(msg)
         with self._lock:
-            self._last_spin_area = area
+            if self._state not in (self._PATROLLING,):
+                self._last_spin_area = area
+                return
+            gain = area - self._last_spin_area
+            if gain > self._area_spin_gain and not self._area_spin_pending:
+                self._area_spin_pending = True
+                self.get_logger().info(
+                    f'Room entry detected — visible area grew by {gain:.1f} m² '
+                    f'({self._last_spin_area:.1f} → {area:.1f}). Queueing spin.'
+                )
+                spin_node = WaypointNode(0.0, 0.0, spin_after=False, dtype='__spin__')
+                self._wq.appendleft(spin_node)
+                if self._nav_handle is not None:
+                    if self._current and self._current.dtype is None:
+                        self._wq.insert(1, self._current)
+                        self._current = None
+                    self._nav_handle.cancel_goal_async()
+                self._last_spin_area = area
 
     @staticmethod
     def _scan_polygon_area(msg: LaserScan) -> float:
-        """Shoelace area of the polygon formed by valid LIDAR ray endpoints."""
         pts = []
         for i, r in enumerate(msg.ranges):
             if msg.range_min < r < msg.range_max:
@@ -311,7 +295,6 @@ class TaskExecutor(Node):
                 self._insert_detection(node)
 
     def _already_queued(self, x, y):
-        """True if a detection within _DUP_DIST is already queued. (lock held)"""
         def close(n):
             return n.dtype is not None and math.hypot(n.x - x, n.y - y) < self._DUP_DIST
         if self._current and close(self._current):
@@ -319,8 +302,7 @@ class TaskExecutor(Node):
         return any(close(n) for n in self._wq)
 
     def _insert_detection(self, node: WaypointNode):
-        """Insert at front; if patrolling, cancel nav and re-queue current node.
-        Must be called with self._lock held."""
+
         self._wq.appendleft(node)
 
         if self._state == self._PATROLLING and self._nav_handle is not None:
@@ -334,7 +316,6 @@ class TaskExecutor(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _advance(self):
-        """Pop the next node and navigate to it."""
         with self._lock:
             if self._state == self._DONE:
                 return
@@ -346,23 +327,20 @@ class TaskExecutor(Node):
             self._current = self._wq.popleft()
             n = self._current
             self._state = self._HANDLING if n.dtype else self._PATROLLING
-            # Peek at the next patrol node to use as goal heading
-            next_patrol = next((nd for nd in self._wq if nd.dtype is None), None)
+
+        # Spin-in-place node: no navigation, just do the 360° immediately
+        if n.dtype == '__spin__':
+            self.get_logger().info('[SPINNING] Area-triggered 360° spin')
+            self._do_spin()
+            return
 
         self.get_logger().info(
             f'[{self._state}] → ({n.x:.2f}, {n.y:.2f})'
             + (f'  [{n.dtype} id={n.det_id}]' if n.dtype else '')
         )
 
-        if n.dtype:
-            pose = self._approach_pose(n.x, n.y)
-        else:
-            # Face toward the next waypoint so Nav2 doesn't rotate on arrival
-            if next_patrol:
-                yaw = math.atan2(next_patrol.y - n.y, next_patrol.x - n.x)
-            else:
-                yaw = 0.0
-            pose = make_pose('map', self.get_clock().now().to_msg(), n.x, n.y, yaw)
+        pose = (self._approach_pose(n.x, n.y) if n.dtype
+                else make_pose('map', self.get_clock().now().to_msg(), n.x, n.y))
 
         self._send_nav(pose, self._on_nav_done)
 
@@ -387,7 +365,7 @@ class TaskExecutor(Node):
             return
 
         if n and n.dtype == 'face':
-            self._say(self._greet_cli, 'Idiot over here')
+            self._say(self._greet_cli, 'Hello!')
             with self._lock:
                 self._visited_faces.add(n.det_id)
                 done = self._check_task_complete()
@@ -396,13 +374,16 @@ class TaskExecutor(Node):
             self._advance()
 
         elif n and n.dtype == 'ring':
-            self._say(self._color_cli, n.color or 'I dont fucking know the color figure it out yourself idiot')
+            self._say(self._color_cli, n.color or 'unknown')
             with self._lock:
                 self._visited_rings.add(n.det_id)
                 done = self._check_task_complete()
             if done:
                 return
             self._advance()
+
+        elif n and n.spin_after:
+            self._do_spin()
 
         else:
             self._advance()
@@ -422,7 +403,7 @@ class TaskExecutor(Node):
         )
         return False
 
-    # ── 360° spin (used only for detection approach, kept for completeness) ────
+    # ── 360 no scope ──────────────────────────────────────────────────────────────
 
     def _do_spin(self):
         with self._lock:
@@ -472,44 +453,6 @@ class TaskExecutor(Node):
 
         fut.add_done_callback(_accepted)
 
-    # ── waypoint ordering ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _nearest_neighbor_order(pts, start_xy):
-        """Reorder pts via greedy nearest-neighbor starting from start_xy."""
-        remaining = list(pts)
-        ordered = []
-        cx, cy = start_xy
-        while remaining:
-            nearest = min(remaining, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
-            ordered.append(nearest)
-            remaining.remove(nearest)
-            cx, cy = nearest
-        return ordered
-
-    @staticmethod
-    def _two_opt(pts):
-        """Improve a route with iterative 2-opt edge swaps."""
-        best = list(pts)
-        n = len(best)
-        if n < 4:
-            return best
-        improved = True
-        while improved:
-            improved = False
-            for i in range(1, n - 1):
-                for j in range(i + 1, n):
-                    a, b = best[i - 1], best[i]
-                    c, d = best[j - 1], best[j % n]
-                    before = (math.hypot(a[0] - b[0], a[1] - b[1])
-                              + math.hypot(c[0] - d[0], c[1] - d[1]))
-                    after  = (math.hypot(a[0] - c[0], a[1] - c[1])
-                              + math.hypot(b[0] - d[0], b[1] - d[1]))
-                    if after < before - 1e-10:
-                        best[i:j] = best[i:j][::-1]
-                        improved = True
-        return best
-
     # ── approach pose ──────────────────────────────────────────────────────────
 
     def _robot_xy(self):
@@ -537,7 +480,7 @@ class TaskExecutor(Node):
             return
         req = Speech.Request()
         req.data = text
-        client.call_async(req)   # fire-and-forget
+        client.call_async(req)  
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
@@ -557,4 +500,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
