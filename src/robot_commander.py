@@ -35,6 +35,11 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
 
+#ZA DRUGI KROG
+from rins_robot.msg import FaceCoords
+from rins_robot.msg import RingCoords
+from rins_robot.srv import Speech
+import numpy as np
 
 class TaskResult(Enum):
     UNKNOWN = 0
@@ -66,6 +71,17 @@ class RobotCommander(Node):
         # ROS2 subscribers
         self.create_subscription(DockStatus, 'dock_status', self._dockCallback, qos_profile_sensor_data)
         self.localization_pose_sub = self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amclPoseCallback, amcl_pose_qos)
+
+        #-----------------------------------------------------------------------------------------
+        self.create_subscription(FaceCoords,"/face_coords",self.updateFaceCoords,10)
+        self.create_subscription(RingCoords,"/ring_coords",self.updateRingCoords,10)
+
+        self.greetClient = self.create_client(Speech,"/greet_service")
+        self.sayColorClient = self.create_client(Speech,"/sayColor_service")
+
+        self.faces = []
+        self.rings = []
+        #-----------------------------------------------------------------------------------------
         
         # ROS2 publishers
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
@@ -76,7 +92,7 @@ class RobotCommander(Node):
         self.undock_action_client = ActionClient(self, Undock, 'undock')
         self.dock_action_client = ActionClient(self, Dock, 'dock')
 
-        self.get_logger().info(f"Robot commander has been initialized!")
+        self.get_logger().info(f"NEW Robot commander has been initialized!")
         
     def destroyNode(self):
         self.nav_to_pose_client.destroy()
@@ -288,8 +304,106 @@ class RobotCommander(Node):
         self.get_logger().debug(msg)
         return
     
+    #---------------------------------------------------------------------------
+    def updateFaceCoords(self,data):
+        self.faces = list(zip(data.points, data.ids))
+
+    def updateRingCoords(self,data):
+        self.rings = list(zip(data.points, data.ids,data.colors))
+
+    def get_robot_position(self):
+        return np.array([
+            self.current_pose.pose.position.x,
+            self.current_pose.pose.position.y,
+            self.current_pose.pose.position.z
+        ])
+
+    def visitDetections(self):
+        #najprej obrazi
+        request = Speech.Request()
+        request.data = "Hello, human"
+
+        facesCopy = self.faces.copy()
+        for point,id in facesCopy:
+            self.info(f"Going towards face {id}.")
+            x = point.x
+            y = point.y
+
+            goal_pose = PoseStamped()
+            goal_pose.header.frame_id = 'map'
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
+
+            goal_pose.pose.position.x = x
+            goal_pose.pose.position.y = y
+
+            robotPos = self.get_robot_position()
+
+            dx = x - robotPos[0] #da se obrne proti obrazu
+            dy = y - robotPos[1]
+            yaw = np.arctan2(dy, dx)
+            goal_pose.pose.orientation = self.YawToQuaternion(yaw)
+
+            self.goToPose(goal_pose)
+
+            self.info("Waiting for the task to complete...")
+            while not self.isTaskComplete():
+                time.sleep(1)
+
+            while not self.greetClient.wait_for_service(timeout_sec=1.0):
+                self.warn('Waiting for /greet_service...')
+            
+            future = self.greetClient.call_async(request)
+            rclpy.spin_until_future_complete(self,future)
+            #time.sleep(2.0)
+            response = future.result()
+            if response is not None and response.success == True:
+                self.info("Sucessfuly talked to a human!")
+            else:
+                self.info("Failed to talk to a human!")
+
+        #obisci ringe
+        ringsCopy = self.rings.copy()
+        for point,id,color in ringsCopy:
+            self.info(f"Going towards ring {id}.")
+            x = point.x
+            y = point.y
+            request.data = color
+            
+            goal_pose = PoseStamped()
+            goal_pose.header.frame_id = 'map'
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
+
+            goal_pose.pose.position.x = x
+            goal_pose.pose.position.y = y
+
+            robotPos = self.get_robot_position()
+
+            dx = x - robotPos[0] #da se obrne proti ringu
+            dy = y - robotPos[1]
+            yaw = np.arctan2(dy, dx)
+            goal_pose.pose.orientation = self.YawToQuaternion(yaw)
+
+            self.goToPose(goal_pose)
+
+            self.info("Waiting for the task to complete...")
+            while not self.isTaskComplete():
+                time.sleep(1)
+
+            while not self.sayColorClient.wait_for_service(timeout_sec=1.0):
+                self.warn('Waiting for /sayColor_service...')
+            
+            future = self.sayColorClient.call_async(request)
+            rclpy.spin_until_future_complete(self,future)
+            #time.sleep(2.0)
+            response = future.result()
+            if response is not None and response.success == True:
+                self.info("Sucessfuly talked to a ring!")
+            else:
+                self.info("Failed to talk to a ring!")
+    #--------------------------------------------------------------------------
+
 def main(args=None):
-    
+    print("Running new Commander!")
     rclpy.init(args=args)
     rc = RobotCommander()
 
@@ -324,8 +438,9 @@ def main(args=None):
         (16, -1.15, 1.3, 0)
     ]
     
-    
-    for id, x, y, yaw in koordinate:
+    #---------------------------------------------------------------------
+    #PRVI KROG - DETEKCIJE
+    for id, x, y, yaw in koordinate: 
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = rc.get_clock().now().to_msg()
@@ -337,9 +452,16 @@ def main(args=None):
 
         rc.goToPose(goal_pose)
 
+        rc.info("Waiting for the task to complete...")
         while not rc.isTaskComplete():
-            rc.info("Waiting for the task to complete...")
+            #rc.info("Waiting for the task to complete...")
             time.sleep(1)
+    #-----------------------------------------------------------------
+    #DRUGI KROG - OBISKI DETECTIONOV
+    rc.info("Going to visit detections now")
+    rc.visitDetections()
+    rc.info("Finishing, give good grade!")
+    #-------------------------------------------------------------------
 
     rc.destroyNode()
     
