@@ -65,13 +65,9 @@ class RingDetector(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Naročnine (subscribers)
-        self.image_sub = self.create_subscription(
-            Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
-        self.depth_sub = self.create_subscription(
-            Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
-        self.pointcloud_sub = self.create_subscription(
-            PointCloud2, "/oakd/rgb/preview/depth/points",
-            self.pointcloud_callback, qos_profile_sensor_data)
+        self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
+        self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
+        self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
 
         # Objava tabele obročev na /ring_coords vsakih 0.2 s
         self.coord_publisher = self.create_publisher(RingCoords, "/ring_coords", 10)
@@ -84,7 +80,6 @@ class RingDetector(Node):
 
 
     def image_callback(self, data):
-        """Glavni callback: sprejme RGB sliko in izvede celotno detekcijo obročev."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:
@@ -100,9 +95,9 @@ class RingDetector(Node):
         depth = self.latest_depth.copy()
 
         # Varnostni check: RGB in depth morata imeti enako resolucijo
-        if cv_image.shape[:2] != depth.shape[:2]:
-            self.get_logger().warn("RGB in depth resoluciji se ne ujemata!")
-            return
+        # if cv_image.shape[:2] != depth.shape[:2]:
+        #     self.get_logger().warn("RGB in depth resoluciji se ne ujemata!")
+        #     return
 
         # Počistimo zaznave iz prejšnjega frame-a
         self.rings_2d.clear()
@@ -111,9 +106,9 @@ class RingDetector(Node):
         # Naredimo binarno sliko kjer so beli samo piksli z globino v
         # želenem razponu [binary_depth_min, binary_depth_max].
         # S tem dobimo masko predmetov na primernih razdaljah.
-        valid = np.isfinite(depth) & (depth > self.min_valid_depth) & (depth < self.max_valid_depth)
+        # valid = np.isfinite(depth) & (depth > self.min_valid_depth) & (depth < self.max_valid_depth)
         thresh = np.zeros(depth.shape, dtype=np.uint8)
-        thresh[valid & (depth > self.binary_depth_min) & (depth < self.binary_depth_max)] = 255
+        thresh[depth & (depth > self.binary_depth_min) & (depth < self.binary_depth_max)] = 255
 
         # Morphološke operacije: OPEN odstrani šum, CLOSE zapolni luknje v konturah
         kernel = np.ones((3, 3), np.uint8)
@@ -176,7 +171,6 @@ class RingDetector(Node):
         cv2.waitKey(1)
 
     def depth_callback(self, data):
-        """Sprejme depth sliko in jo shrani za kasnejšo uporabo v image_callback."""
         try:
             depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
         except CvBridgeError as e:
@@ -228,9 +222,7 @@ class RingDetector(Node):
             for i, (ring_id, ring_pt, ring_color) in enumerate(self.coords):
                 if ring_color != color:
                     continue
-                if (abs(ring_pt.x - x) < self.merge_distance_xy and
-                        abs(ring_pt.y - y) < self.merge_distance_xy and
-                        abs(ring_pt.z - z) < self.merge_distance_z):
+                if (abs(ring_pt.x - x) < self.merge_distance_xy and abs(ring_pt.y - y) < self.merge_distance_xy and abs(ring_pt.z - z) < self.merge_distance_z):
                     # Povprečimo pozicijo z novo zaznavo (running average)
                     ring_pt.x = (ring_pt.x + x) / 2.0
                     ring_pt.y = (ring_pt.y + y) / 2.0
@@ -419,9 +411,12 @@ class RingDetector(Node):
         if len(colored) < 10:
             # Pretežno akromatska barva → določimo po svetlosti
             median_v = float(np.median(v))
-            if   median_v > 180: return "white"
-            elif median_v < 60:  return "black"
-            else:                return "gray"
+            if   median_v > 180: 
+                return "white"
+            elif median_v < 60:  
+                return "black"
+            else:                
+                return "gray"
 
         # H je v razponu 0–179 (OpenCV konvencija)
         median_h = float(np.median(colored[:, 0]))
