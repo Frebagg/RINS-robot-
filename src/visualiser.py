@@ -39,6 +39,7 @@ class visualizeMarkers(Node):
 
     def manageFaceMarkers_callback(self,msg):
         if len(msg.points) != len(msg.ids):
+            self.get_logger().info("Length mismatch in face_coords!")
             return
 
         for face, id in zip(msg.points, msg.ids):
@@ -71,8 +72,8 @@ class visualizeMarkers(Node):
             text.type = Marker.TEXT_VIEW_FACING
             text.pose.position.x = face.x
             text.pose.position.y = face.y
-            text.pose.position.z = face.z + 0.5
-            text.scale.z = 0.25
+            text.pose.position.z = face.z + 0.8
+            text.scale.z = 0.5
             text.color.r = 1.0
             text.color.g = 1.0
             text.color.b = 1.0
@@ -83,10 +84,13 @@ class visualizeMarkers(Node):
 
             self.faceMarkerPublisher.publish(text)
             self.faceMarkerPublisher.publish(marker)
+            self.get_logger().info(f"Published face {id}!")
+            #self.get_logger().info(f"P")
 
 
     def manageRingMarkers_callback(self,msg):
         if len(msg.points) != len(msg.ids) or len(msg.points) != len(msg.colors):
+            self.get_logger().info("Length mismatch in ring_coords!")
             return
 
         for ring, ring_id, color in zip(msg.points, msg.ids, msg.colors):
@@ -119,7 +123,7 @@ class visualizeMarkers(Node):
             text.type = Marker.TEXT_VIEW_FACING
             text.pose.position.x = ring.x
             text.pose.position.y = ring.y
-            text.pose.position.z = ring.z + 0.5
+            text.pose.position.z = ring.z + 0.8
             r, g, b = self.color_to_rgb(color)
             text.scale.z = 0.25
             text.color.r = r
@@ -132,6 +136,7 @@ class visualizeMarkers(Node):
 
             self.ringMarkerPublisher.publish(text)
             self.ringMarkerPublisher.publish(marker)
+            self.get_logger().info(f"Published ring {ring_id}!")
 
     def color_to_rgb(self, color_name):
         if color_name == "red":
