@@ -461,7 +461,7 @@ def main(args=None):
         (8, 1.4, -2.5, 1),
         (9, 2.55, -1.3, 2),
         (10, 1.0, 0.3, 1),
-        (11, -1.75, 0.6, 5)
+        (11, -1.8, 0.3, 5)
     ]
     
     #---------------------------------------------------------------------
@@ -496,6 +496,8 @@ def main(args=None):
         while not rc.isTaskComplete():
             #rc.info("Waiting for the task to complete...")
             time.sleep(1)
+    
+    time.sleep(1)
     #-----------------------------------------------------------------
     #DRUGI KROG - OBISKI DETECTIONOV
     rc.info("Going to visit detections now")
