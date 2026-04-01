@@ -41,9 +41,8 @@ class RingDetector(Node):
         # inner_scale: notranja elipsa je inner_scale-krat manjša od zunanje.
         # Prostor znotraj notranje elipse = luknja obroča.
         self.inner_scale             = 0.45  # razmerje notranje elipse
-        self.depth_thr               = 0.10  # luknja mora biti vsaj toliko dlje od obroča [m]
+        self.depth_thr               = 0.20  # center mora biti vsaj toliko dlje od obroča [m]
         self.min_ring_depth_points   = 12    # min veljavnih depth vzorcev na obroču
-        self.min_center_depth_points = 8     # min veljavnih depth vzorcev v luknji
 
         # Parametri za združevanje zaznav v tabelo obročev
         # Če je nova zaznava bliže od teh pragov obstoječemu obroču,
@@ -256,41 +255,59 @@ class RingDetector(Node):
 
     def ellipse_is_ring(self, depth, ellipse):
         """
-        Preveri ali je elipsa dejansko obroč z luknjo.
-
-        Logika:
-          1. Naredimo masko za pas obroča (med zunanjo in notranjo elipso).
-          2. Naredimo masko za luknjo (notranjost notranje elipse).
-          3. Če je mediana globine v luknji večja od mediane globine obroča
-             za vsaj depth_thr, potem je to obroč (luknja je dlje = gledamo skozi).
-          4. Če luknja nima dovolj veljavnih depth točk (morda je za robom slike),
-             privzamemo da je obroč — boljše lažno pozitivno kot da bi ga zgrešili.
-
-        Vrne: (is_ring: bool, inner_ellipse)
+        Enostaven depth check:
+          - vzamemo depth v centru elipse
+          - vzamemo mediano depth vrednosti na obodu elipse
+          - center mora biti vsaj `depth_thr` dlje od oboda
         """
-        ring_mask, inner_mask, inner_ellipse = self.make_ring_mask(depth.shape, ellipse)
+        _, _, inner_ellipse = self.make_ring_mask(depth.shape, ellipse)
 
-        # Depth vrednosti na pasu obroča (material)
-        ring_depths = depth[ring_mask > 0]
+        # Vzorčenje depth vrednosti na obodu zunanje elipse.
+        ring_depths = self.get_ellipse_perimeter_depths(depth, ellipse)
         ring_depths = self.filter_valid_depths(ring_depths)
         if len(ring_depths) < self.min_ring_depth_points:
             return False, inner_ellipse
         ring_depth = float(np.median(ring_depths))
 
-        # Depth vrednosti v luknji
-        center_depths = depth[inner_mask > 0]
-        center_depths = self.filter_valid_depths(center_depths)
+        # Uporabimo center pixel elipse.
+        cx = int(round(ellipse[0][0]))
+        cy = int(round(ellipse[0][1]))
 
-        # Premalo točk v luknji → verjetno je luknja izven dosega senzorja,
-        # kar pomeni da je globoka/prazna → štejemo kot obroč
-        if len(center_depths) < self.min_center_depth_points:
+        if cy < 0 or cy >= depth.shape[0] or cx < 0 or cx >= depth.shape[1]:
+            return False, inner_ellipse
+
+        center_depth = float(depth[cy, cx])
+
+        # Pri obročih v zraku center pogosto gleda v "prazno" (brez depth povratka).
+        # To je koristen signal luknje, zato inf/NaN ali zelo velika depth v centru
+        # obravnavamo kot pozitiven primer, če je obod elipse že veljaven.
+        if not np.isfinite(center_depth) or center_depth >= self.max_valid_depth:
             return True, inner_ellipse
 
-        center_depth = float(np.median(center_depths))
+        if center_depth <= self.min_valid_depth:
+            return False, inner_ellipse
 
-        # Luknja mora biti dlje od materiala obroča
+        # Center mora biti dlje od oboda za vsaj depth_thr.
         is_ring = center_depth > ring_depth + self.depth_thr
         return is_ring, inner_ellipse
+
+    def get_ellipse_perimeter_depths(self, depth, ellipse, delta_deg=10):
+        """Vrne depth vrednosti na obodu elipse."""
+        h, w = depth.shape[:2]
+        center = (int(round(ellipse[0][0])), int(round(ellipse[0][1])))
+        axes = (
+            max(1, int(round(ellipse[1][0] / 2.0))),
+            max(1, int(round(ellipse[1][1] / 2.0)))
+        )
+        angle = int(round(ellipse[2]))
+
+        pts = cv2.ellipse2Poly(center, axes, angle, 0, 360, delta_deg)
+        if pts is None or len(pts) == 0:
+            return np.array([], dtype=np.float32)
+
+        xs = np.clip(pts[:, 0], 0, w - 1)
+        ys = np.clip(pts[:, 1], 0, h - 1)
+        return depth[ys, xs]
 
     def get_ring_3d_point(self, pointcloud, ellipse):
         """

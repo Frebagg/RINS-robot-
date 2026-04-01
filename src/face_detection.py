@@ -104,13 +104,13 @@ class detect_faces(Node):
 			bestBbox = None
 			bestCenter = None
 			bestConf = 0.0
-			for i in range(len(boxes)):
+			for i in range(len(boxes)): #cez vse skatle
 				confidence = float(boxes.conf[i])
-				if confidence > self.CONFIDENCETHRESHOLD:
+				if confidence > self.CONFIDENCETHRESHOLD: #obravnavas le ce je confidence zadosten
 					vertices = boxes.xyxy[i]
 					cx = int(((vertices[0]+vertices[2])/2))
 					cy = int(((vertices[1]+vertices[3])/2))
-					self.faces.append((cx, cy, confidence))
+					self.faces.append((cx, cy, confidence)) #prvi vmesni seznam
 					if confidence > bestConf:	
 						bestConf = confidence
 						bestBbox = vertices
@@ -145,7 +145,7 @@ class detect_faces(Node):
 		now = self.get_clock().now()
 
 		for cx, cy, conf in self.faces:
-			if cx < 0 or cy < 0 or cx >= width or cy >= height:
+			if cx < 0 or cy < 0 or cx >= width or cy >= height: #ce je center neustrezen
 				continue
 			d = a[cy,cx,:]
 			if np.isnan(d).any(): #ce kaksen NaN continue
@@ -156,7 +156,7 @@ class detect_faces(Node):
 				x = detection.point.x
 				y = detection.point.y
 				z = detection.point.z
-				#ce ni ze zaznan obraz potem posodabljamo pending drugac ce je znan pa updatamo confirmed
+				#ce ni nov obraz potem posodabljamo pending drugac ce je znan pa updatamo confirmed
 				if not self.updateConfirmed(x, y, z, now): 
 					self.updatePending(x, y, z, now)
 
@@ -193,6 +193,7 @@ class detect_faces(Node):
 		if bestIdx < 0:
 			return False
 
+		#povpreci koordinate ce je ta obraz ze bil viden
 		faceId, face, count, _ = self.coords[bestIdx]
 		face.x = (x + face.x) / 2.0
 		face.y = (y + face.y) / 2.0
@@ -200,6 +201,7 @@ class detect_faces(Node):
 		self.coords[bestIdx] = (faceId, face, count + 1, now)
 		return True
 
+	#posodablja drugi vmesni seznam 
 	def updatePending(self, x, y, z, now):
 		bestIdx = -1
 		bestXyDist = float('inf')
