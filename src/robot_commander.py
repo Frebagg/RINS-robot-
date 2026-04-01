@@ -304,9 +304,18 @@ def main(args=None):
     if rc.is_docked:
         rc.undock()
     
+    # "yaw" == 0 : gor
+    # "yaw" == 1 : desno
+    # "yaw" == 2 : dol
+    # "yaw" == 3 : levo
+    # "yaw" == 4 : gor-desno
+    # "yaw" == 5 : dol-desno
+    # "yaw" == 6 : gor-levo
+    # "yaw" == 7 : dol-levo
+    
     koordinate = [
-        (0, 0.0, 0.0, 0),
-        (1, 1.3, 1.8, 0),
+        (0, 0.0, 0.0, 1),
+        (1, 1.3, 1.8, 4),
         (2, 1.0, 2.3, 0),
         (3, 0.0, 2.75, 0),
         (4, -1.0, 2.6, 0),
@@ -331,8 +340,22 @@ def main(args=None):
 
         goal_pose.pose.position.x = x
         goal_pose.pose.position.y = y
-        if yaw == 0:
+        if yaw == 0: # gor
             goal_pose.pose.orientation = rc.YawToQuaternion(0)
+        elif yaw == 1: # desno
+            goal_pose.pose.orientation = rc.YawToQuaternion(-1.57)
+        elif yaw == 2: # dol
+            goal_pose.pose.orientation = rc.YawToQuaternion(3.14)
+        elif yaw == 3: # levo
+            goal_pose.pose.orientation = rc.YawToQuaternion(1.57)
+        elif yaw == 4: # gor-desno
+            goal_pose.pose.orientation = rc.YawToQuaternion(-0.785)
+        elif yaw == 5: # dol-desno
+            goal_pose.pose.orientation = rc.YawToQuaternion(-2.356)
+        elif yaw == 6: # gor-levo
+            goal_pose.pose.orientation = rc.YawToQuaternion(0.785)
+        elif yaw == 7: # dol-levo
+            goal_pose.pose.orientation = rc.YawToQuaternion(2.356)
 
         rc.goToPose(goal_pose)
 
