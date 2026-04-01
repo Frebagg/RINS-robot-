@@ -27,7 +27,7 @@ pkg_rins_robot = get_package_share_directory('rins_robot')
 ARGUMENTS = [
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
     DeclareLaunchArgument('rviz', default_value='true', choices=['true', 'false'], description='Start rviz.'),
-    DeclareLaunchArgument('world', default_value='task1_yellow_demo', description='Simulation World'),
+    DeclareLaunchArgument('world', default_value='task1', description='Simulation World'),
     DeclareLaunchArgument('model', default_value='standard', choices=['standard', 'lite'], description='Turtlebot4 Model'),
     DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false'], description='use_sim_time'),
     DeclareLaunchArgument('map', default_value=PathJoinSubstitution([pkg_rins_robot, 'maps', 'task11.yaml']), description='Full path to map yaml file to load')
