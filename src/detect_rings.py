@@ -24,8 +24,8 @@ class RingDetector(Node):
 
         # Parametri za detekcijo elips
         self.min_contour_points = 20   # min št. točk konture za fitanje elipse
-        self.ratio_thr          = 1.5  # max razmerje osi (filtrira podolgovate elipse)
-        self.ecc_thr            = 100  # max absolutna velikost osi [px]
+        self.ratio_thr          = 2.0  # max razmerje osi (filtrira podolgovate elipse)
+        self.ecc_thr            = 120  # max absolutna velikost osi [px]
 
         # Parametri za veljavnost depth vrednosti
         self.min_valid_depth = 0.05   # bliže od tega je šum [m]
@@ -35,14 +35,14 @@ class RingDetector(Node):
         # Samo piksli v tem razponu globine postanejo beli v binarni sliki.
         # S tem izrežemo ozadje in tla, ki so preveč daleč ali preblizu.
         self.binary_depth_min = 0.5   # [m]
-        self.binary_depth_max = 3.5   # [m]
+        self.binary_depth_max = 4.0   # [m]
 
         # Parametri za validacijo obroča z depth
         # inner_scale: notranja elipsa je inner_scale-krat manjša od zunanje.
         # Prostor znotraj notranje elipse = luknja obroča.
         self.inner_scale             = 0.45  # razmerje notranje elipse
         self.depth_thr               = 0.20  # center mora biti vsaj toliko dlje od obroča [m]
-        self.min_ring_depth_points   = 12    # min veljavnih depth vzorcev na obroču
+        self.min_ring_depth_points   = 15    # min veljavnih depth vzorcev na obroču
 
         # Parametri za združevanje zaznav v tabelo obročev
         # Če je nova zaznava bliže od teh pragov obstoječemu obroču,
@@ -149,7 +149,7 @@ class RingDetector(Node):
             if is_ring:
                 candidates.append((ellipse, inner_ellipse))
 
-        self.get_logger().info(f"Najdenih obročev: {len(candidates)}")
+        #self.get_logger().info(f"Najdenih obročev: {len(candidates)}")
 
         # 4. Izris rezultatov in shranjevanje za pointcloud callback
         for ellipse, inner_ellipse in candidates:
@@ -281,7 +281,7 @@ class RingDetector(Node):
         # Pri obročih v zraku center pogosto gleda v "prazno" (brez depth povratka).
         # To je koristen signal luknje, zato inf/NaN ali zelo velika depth v centru
         # obravnavamo kot pozitiven primer, če je obod elipse že veljaven.
-        if not np.isfinite(center_depth) or center_depth >= self.max_valid_depth:
+        if not np.isfinite(center_depth) or center_depth >= self.max_valid_depth or center_depth == 0:
             return True, inner_ellipse
 
         if center_depth <= self.min_valid_depth:

@@ -392,6 +392,7 @@ class RobotCommander(Node):
             
             future = self.greetClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
+            time.sleep(1)
             #time.sleep(2.0)
             response = future.result()
             if response is not None and response.success == True:
@@ -411,6 +412,7 @@ class RobotCommander(Node):
             
             future = self.sayColorClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
+            time.sleep(1)
             #time.sleep(2.0)
             response = future.result()
             if response is not None and response.success == True:
@@ -448,7 +450,8 @@ def main(args=None):
         (0, 0.0, 0.0, 1),
         (1, 1.3, 1.8, 4),
         (2, 0.5, 2.75, 1),
-        (3, -1.2, 2.75, 0),
+        (3, -1.5, 2.5, 0),
+        (3, -1.5, 2.5, 7),
         (4, -2.6, 2.75, 4),
         (4.5, -2.5, 0.4, 0),
         (5, -1.9, -0.45, 3),
@@ -457,11 +460,13 @@ def main(args=None):
         (6.5, -1.2, -1.3, 1),
         (6.5, -1.2, -2.5, 0),
         (7, 0.0, -1.6, 3),
+        (7.5, 0.6, -3.8, 0),
         (8, 1.4, -2.5, 2),
         (8, 1.4, -2.5, 1),
         (9, 2.55, -1.3, 2),
         (10, 1.0, 0.3, 1),
-        (11, -1.8, 0.3, 5)
+        (10.5, -0.4, 1.2, 2),
+        (11, -1.75, -0.3, 3)
     ]
     
     #---------------------------------------------------------------------
@@ -497,7 +502,7 @@ def main(args=None):
             #rc.info("Waiting for the task to complete...")
             time.sleep(1)
     
-    time.sleep(1)
+    time.sleep(2)
     #-----------------------------------------------------------------
     #DRUGI KROG - OBISKI DETECTIONOV
     rc.info("Going to visit detections now")
