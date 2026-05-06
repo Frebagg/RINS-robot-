@@ -19,15 +19,16 @@ from rclpy.duration import Duration
 
 
 # ---------------------------------------------------------------------------
-# Topic names — verify with `ros2 topic list` on the real robot and adjust.
+# Topic names for the Gemini 355L camera on the real TurtleBot4.
+# Verify with `ros2 topic list` on the real robot if needed.
 # ---------------------------------------------------------------------------
-RGB_TOPIC   = "/oakd/rgb/preview/image_raw"
-DEPTH_TOPIC = "/oakd/stereo/image_raw"
-PC_TOPIC    = "/oakd/stereo/points"
+RGB_TOPIC   = "/gemini/color/image_raw"
+DEPTH_TOPIC = "/gemini/depth/image_raw"
+PC_TOPIC    = "/gemini/depth/points"
 
-# TF frame published by the OAK-D on the real robot.
-# Verify with `ros2 run tf2_tools view_frames`.
-CAMERA_FRAME = "oakd_rgb_camera_optical_frame"
+# TF frame for the Gemini camera.
+# Verify the exact name with `ros2 run tf2_tools view_frames` on the real robot.
+CAMERA_FRAME = "gemini_color_optical_frame"
 
 
 class RingDetector(Node):
@@ -44,7 +45,7 @@ class RingDetector(Node):
         self.inner_scale        = 0.45  # inner ellipse = outer * inner_scale
 
         # ------------------------------------------------------------------
-        # Depth parameters — loosened vs sim for real OAK-D noise
+        # Depth parameters — tuned for Gemini 355L real sensor noise
         # ------------------------------------------------------------------
         self.min_valid_depth        = 0.3   # [m]
         self.max_valid_depth        = 5.0   # [m]
@@ -157,12 +158,20 @@ class RingDetector(Node):
 
     def depth_callback(self, data):
         try:
-            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
-        except CvBridgeError as e:
-            self.get_logger().error(str(e))
-            return
+            # The Gemini 355L publishes depth as 16UC1 in millimetres.
+            # Convert to float32 metres to match all downstream thresholds.
+            # If the camera ever publishes 32FC1 in metres, remove / 1000.0
+            # and change the encoding string below.
+            raw = self.bridge.imgmsg_to_cv2(data, "16UC1")
+            depth_image = raw.astype(np.float32) / 1000.0
+        except CvBridgeError:
+            # Fallback: some Gemini firmware versions publish 32FC1 in metres
+            try:
+                depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1").astype(np.float32)
+            except CvBridgeError as e:
+                self.get_logger().error(f"depth_callback encoding error: {e}")
+                return
 
-        depth_image = depth_image.astype(np.float32)
         depth_image[~np.isfinite(depth_image)] = 0.0
         self.latest_depth = depth_image
 
