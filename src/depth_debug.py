@@ -4,21 +4,26 @@ Ring detector for TurtleBot 4 with Orbbec Gemini 335L (RGB-D).
 
 Pipeline
 --------
-1. Subscribe to synchronized RGB image + depth image.
-2. Back-project the depth image to a (H, W, 3) XYZ array using the camera
-   intrinsics from CameraInfo.
-3. Per color (red, green, blue, black) build an HSV mask, find contours,
+1. Subscribe to synchronized RGB image + organized PointCloud2.
+2. Per color (red, green, blue, black) build an HSV mask, find contours,
    fit ellipses, keep ring-shaped ones (hollow interior check).
-4. NMS across all candidates.
-5. For each surviving ellipse: walk the LOWER rim, look up XYZ from the
-   back-projected grid (gated by the color mask).
-6. Fit a 3D circle to the rim points: SVD plane fit -> 2D circle in plane
+3. NMS across all candidates.
+4. For each surviving ellipse: walk the LOWER rim, look up XYZ from the
+   organized cloud (gated by the color mask so the hanger arm and
+   background don't pollute samples).
+5. Fit a 3D circle to the rim points: SVD plane fit -> 2D circle in plane
    via Kasa's linear least squares. Reject if radius is implausible or
    residual is too large.
-7. Build a Pose with the circle's center and the plane's normal as the
+6. Build a Pose with the circle's center and the plane's normal as the
    approach direction (+X axis). Transform to map frame.
-8. Per-color nearest-neighbor tracking; publish PoseArray + MarkerArray
+7. Per-color nearest-neighbor tracking; publish PoseArray + MarkerArray
    (sphere + arrow showing approach direction + text label).
+
+Run
+---
+    ros2 run <your_pkg> ring_detector
+or directly:
+    python3 ring_detector.py --ros-args -r __ns:=/rins
 """
 
 from __future__ import annotations
@@ -36,7 +41,8 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+import sensor_msgs_py.point_cloud2 as pc2
 from std_msgs.msg import ColorRGBA, Header
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_geometry_msgs import do_transform_point
@@ -49,9 +55,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 # ---------------------------------------------------------------------------
 RGB_TOPIC = "/gemini/color/image_raw"
 DEPTH_TOPIC = "/gemini/depth/image_raw"
+PC_TOPIC = "/gemini/depth/points"
 INFO_TOPIC = "/gemini/color/camera_info"
-# Frame the depth image is expressed in. On the Gemini with depth aligned
-# to color (the usual default), this is the color optical frame.
 CAMERA_FRAME = "gemini_color_optical_frame"
 TARGET_FRAME = "map"
 
@@ -141,15 +146,13 @@ class RingDetector(Node):
     def __init__(self) -> None:
         super().__init__("ring_detector")
 
-        # Use the canonical sensor_data QoS profile -- this is what camera
-        # drivers (Orbbec, Realsense, etc.) are supposed to publish with, and
-        # it's the simplest way to guarantee we match the publisher exactly.
-        # Hand-rolling a profile (BEST_EFFORT + KEEP_LAST(5)) sometimes fails
-        # to match if the publisher uses BEST_EFFORT + KEEP_LAST(10) or has
-        # a different liveliness/deadline. Using the named profile avoids
-        # that whole class of problem.
-        from rclpy.qos import qos_profile_sensor_data
-        sensor_qos = qos_profile_sensor_data
+        # Sensor QoS: cameras typically publish BEST_EFFORT. Using a matching
+        # profile prevents the subscriber from silently dropping every frame.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
 
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
@@ -168,33 +171,18 @@ class RingDetector(Node):
             CameraInfo, INFO_TOPIC, self._on_camera_info, sensor_qos
         )
 
-        # Time-synchronized RGB + depth image.
-        # We use the depth image rather than the point cloud topic because
-        # the Orbbec driver doesn't always publish a cloud (and when it does
-        # the topic name varies). Depth + CameraInfo carries the same info
-        # and is universally available.
+        # Time-synchronized RGB + organized point cloud.
+        # The cloud is "organized": its width/height match the camera image,
+        # so cloud[v, u] gives the 3D point for pixel (u, v) -- this is what
+        # makes the hybrid approach work cleanly.
         self.rgb_sub = Subscriber(self, Image, RGB_TOPIC, qos_profile=sensor_qos)
-        self.depth_sub = Subscriber(self, Image, DEPTH_TOPIC, qos_profile=sensor_qos)
+        self.pc_sub = Subscriber(self, PointCloud2, PC_TOPIC, qos_profile=sensor_qos)
         self.sync = ApproximateTimeSynchronizer(
-            [self.rgb_sub, self.depth_sub],
-            queue_size=30,
-            slop=0.5,
+            [self.rgb_sub, self.pc_sub],
+            queue_size=10,
+            slop=0.15,  # cloud generation adds latency; allow a bit more slop
         )
         self.sync.registerCallback(self._on_frames)
-
-        # Diagnostic counters for the "synchronizer never fires" failure mode.
-        # We tap each topic with a plain subscription so we can see ticks
-        # independently of the synchronizer.
-        self._rgb_ticks = 0
-        self._depth_ticks = 0
-        self._sync_ticks = 0
-        self.create_subscription(
-            Image, RGB_TOPIC, self._tick_rgb, sensor_qos
-        )
-        self.create_subscription(
-            Image, DEPTH_TOPIC, self._tick_depth, sensor_qos
-        )
-        self.create_timer(2.0, self._diag_log)
 
         # Publishers.
         self.poses_pub = self.create_publisher(PoseArray, "rings/poses", 10)
@@ -229,83 +217,42 @@ class RingDetector(Node):
         self.cx = float(msg.k[2])
         self.cy = float(msg.k[5])
 
-    # --- diagnostics -------------------------------------------------------
-    def _tick_rgb(self, msg: Image) -> None:
-        self._rgb_ticks += 1
-        self._last_rgb_stamp = msg.header.stamp
-
-    def _tick_depth(self, msg: Image) -> None:
-        self._depth_ticks += 1
-        self._last_depth_stamp = msg.header.stamp
-
-    def _diag_log(self) -> None:
-        if self._sync_ticks > 0:
-            return
-
-        rgb_t = getattr(self, "_last_rgb_stamp", None)
-        depth_t = getattr(self, "_last_depth_stamp", None)
-        if rgb_t is None and depth_t is None:
-            self.get_logger().warn(
-                "No RGB and no depth messages seen yet. "
-                f"Check `ros2 topic list` for {RGB_TOPIC} and {DEPTH_TOPIC}.",
-                throttle_duration_sec=4.0,
-            )
-            return
-        if rgb_t is None:
-            self.get_logger().warn(
-                f"Depth ticking ({self._depth_ticks}) but no RGB on "
-                f"{RGB_TOPIC}.",
-                throttle_duration_sec=4.0,
-            )
-            return
-        if depth_t is None:
-            self.get_logger().warn(
-                f"RGB ticking ({self._rgb_ticks}) but no depth on "
-                f"{DEPTH_TOPIC}. Check `ros2 topic list | grep depth`.",
-                throttle_duration_sec=4.0,
-            )
-            return
-
-        rgb_s = rgb_t.sec + rgb_t.nanosec * 1e-9
-        depth_s = depth_t.sec + depth_t.nanosec * 1e-9
-        delta = depth_s - rgb_s
-        self.get_logger().warn(
-            f"Both topics tick (rgb={self._rgb_ticks}, depth={self._depth_ticks}) "
-            f"but synchronizer hasn't fired. Latest stamp delta "
-            f"(depth - rgb) = {delta:.3f}s. If large, check use_sim_time "
-            "or raise slop further.",
-            throttle_duration_sec=4.0,
-        )
-
-    def _on_frames(self, rgb_msg: Image, depth_msg: Image) -> None:
-        self._sync_ticks += 1
-        if self.fx is None:
-            return  # need intrinsics to back-project depth into XYZ
-
+    def _on_frames(self, rgb_msg: Image, pc_msg: PointCloud2) -> None:
         try:
             rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
         except Exception as exc:
             self.get_logger().warn(f"RGB conversion failed: {exc}")
             return
 
-        try:
-            depth_raw = self.bridge.imgmsg_to_cv2(
-                depth_msg, desired_encoding="passthrough"
+        # The cloud must be ORGANIZED (height > 1) for our pixel-based lookup
+        # to work. If the driver publishes an unorganized cloud (height==1),
+        # we'd need to project each point through K to find its pixel -- much
+        # more expensive. The Gemini driver publishes organized clouds, but
+        # warn loudly if that ever changes.
+        if pc_msg.height <= 1:
+            self.get_logger().warn(
+                "PointCloud2 is unorganized (height=1). Pixel-indexed XYZ "
+                "lookup won't work. Check the camera driver config.",
+                throttle_duration_sec=5.0,
             )
-        except Exception as exc:
-            self.get_logger().warn(f"Depth conversion failed: {exc}")
             return
 
-        # Normalize depth to meters. Depth can be 16UC1 (mm) or 32FC1 (m).
-        if depth_raw.dtype == np.uint16:
-            depth_m = depth_raw.astype(np.float32) / 1000.0
-        else:
-            depth_m = depth_raw.astype(np.float32)
+        # Sanity: cloud dimensions should match the image. If they're different
+        # (e.g. depth at 640x480, color at 1280x720), we'd need to rescale the
+        # ellipse coordinates. Easier to enforce a matched config.
+        if (pc_msg.width, pc_msg.height) != (rgb.shape[1], rgb.shape[0]):
+            self.get_logger().warn(
+                f"Cloud size {pc_msg.width}x{pc_msg.height} != image size "
+                f"{rgb.shape[1]}x{rgb.shape[0]}. Configure the driver to "
+                "align them, or add rescaling here.",
+                throttle_duration_sec=5.0,
+            )
+            return
 
-        # Build a (H, W, 3) XYZ image from depth + intrinsics. This is the
-        # exact same data that an organized point cloud would carry, just
-        # synthesized client-side instead of in the driver.
-        xyz = self._depth_to_xyz_image(depth_m)
+        # Convert PointCloud2 to a (H, W, 3) numpy array of XYZ in camera frame.
+        # NaN entries mark invalid pixels (no depth return). We keep them as
+        # NaN so downstream code can filter them with np.isfinite.
+        xyz = self._cloud_to_xyz_image(pc_msg)
 
         debug = rgb.copy()
         hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV)
@@ -339,12 +286,8 @@ class RingDetector(Node):
                 continue
             center_cam, normal_cam, radius_m, residual_m = fit
 
-            pose_cam = self._build_pose_from_center_normal(
-                center_cam, normal_cam, frame_id=CAMERA_FRAME
-            )
-            pose_map = self._to_target_frame_pose(
-                pose_cam, rgb_msg.header.stamp, source_frame=CAMERA_FRAME
-            )
+            pose_cam = self._build_pose_from_center_normal(center_cam, normal_cam)
+            pose_map = self._to_target_frame_pose(pose_cam, rgb_msg.header.stamp)
             if pose_map is None:
                 continue
 
@@ -475,42 +418,28 @@ class RingDetector(Node):
     # -----------------------------------------------------------------------
     # 3D estimation (point-cloud based)
     # -----------------------------------------------------------------------
-    def _depth_to_xyz_image(self, depth_m: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _cloud_to_xyz_image(pc_msg: PointCloud2) -> np.ndarray:
         """
-        Back-project a depth image to a (H, W, 3) array of XYZ in camera frame.
+        Convert a PointCloud2 to a (H, W, 3) float32 array of XYZ in camera frame.
 
-        For each pixel (u, v) with depth z:
-            X = (u - cx) * z / fx
-            Y = (v - cy) * z / fy
-            Z = z
-
-        This is the inverse of the pinhole projection. Vectorized over the
-        full image with numpy meshgrid -- a couple of multiplications per
-        pixel, runs in single-digit ms for VGA depth.
-
-        Pixels with z==0 (driver convention for "no return") or out of our
-        usable depth band become NaN, so np.isfinite filters them downstream.
+        Why we don't just np.frombuffer the raw data: the cloud's point_step
+        often includes padding (e.g. 32 bytes per point with x,y,z,rgb
+        followed by reserved bytes). Going through sensor_msgs_py is robust
+        to whatever layout the driver chose and handles big-endian, NaN
+        sentinels, and missing-field cases consistently.
         """
-        h, w = depth_m.shape
-        # Cache the (u-cx)/fx and (v-cy)/fy grids once -- they only depend on
-        # intrinsics and image size, not on the depth values.
-        if not hasattr(self, "_unproj_cache") or self._unproj_cache[0] != (h, w):
-            us = np.arange(w, dtype=np.float32)
-            vs = np.arange(h, dtype=np.float32)
-            uu, vv = np.meshgrid(us, vs)
-            x_per_z = (uu - self.cx) / self.fx
-            y_per_z = (vv - self.cy) / self.fy
-            self._unproj_cache = ((h, w), x_per_z, y_per_z)
-        _, x_per_z, y_per_z = self._unproj_cache
-
-        z = depth_m
-        valid = (z > DEPTH_MIN_M) & (z < DEPTH_MAX_M) & np.isfinite(z)
-
-        xyz = np.full((h, w, 3), np.nan, dtype=np.float32)
-        # Only fill valid pixels; the rest stay NaN.
-        xyz[..., 0] = np.where(valid, x_per_z * z, np.nan)
-        xyz[..., 1] = np.where(valid, y_per_z * z, np.nan)
-        xyz[..., 2] = np.where(valid, z, np.nan)
+        # read_points returns a structured array; we extract just XYZ.
+        # skip_nans=False so the H*W shape is preserved -- we want NaN entries
+        # to mark invalid pixels, not get silently dropped.
+        pts = pc2.read_points(
+            pc_msg, field_names=("x", "y", "z"), skip_nans=False, reshape_organized_cloud=True
+        )
+        # pts is a structured ndarray of shape (H, W); each entry has (x, y, z).
+        # Stack into a regular (H, W, 3) float32 view.
+        xyz = np.stack(
+            [pts["x"], pts["y"], pts["z"]], axis=-1
+        ).astype(np.float32, copy=False)
         return xyz
 
     def _fit_ring_3d(
@@ -640,9 +569,7 @@ class RingDetector(Node):
 
     @staticmethod
     def _build_pose_from_center_normal(
-        center_cam: np.ndarray,
-        normal_cam: np.ndarray,
-        frame_id: str = CAMERA_FRAME,
+        center_cam: np.ndarray, normal_cam: np.ndarray
     ) -> PoseStamped:
         """
         Build a PoseStamped (in camera frame) where the orientation's +X axis
@@ -672,7 +599,7 @@ class RingDetector(Node):
         q = RingDetector._mat_to_quat(R)
 
         ps = PoseStamped()
-        ps.header.frame_id = frame_id
+        ps.header.frame_id = CAMERA_FRAME
         ps.pose.position.x = float(center_cam[0])
         ps.pose.position.y = float(center_cam[1])
         ps.pose.position.z = float(center_cam[2])
@@ -713,23 +640,18 @@ class RingDetector(Node):
             z = 0.25 * s
         return np.array([x, y, z, w], dtype=np.float64)
 
-    def _to_target_frame_pose(
-        self,
-        pose_cam: PoseStamped,
-        stamp,
-        source_frame: str = CAMERA_FRAME,
-    ) -> Optional[Pose]:
-        """Transform a PoseStamped from `source_frame` into TARGET_FRAME."""
+    def _to_target_frame_pose(self, pose_cam: PoseStamped, stamp) -> Optional[Pose]:
+        """Transform a PoseStamped from camera frame into TARGET_FRAME."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 TARGET_FRAME,
-                source_frame,
+                CAMERA_FRAME,
                 stamp,
                 timeout=Duration(seconds=0.2),
             )
         except TransformException as exc:
             self.get_logger().warn(
-                f"TF {source_frame} -> {TARGET_FRAME} unavailable: {exc}",
+                f"TF {CAMERA_FRAME} -> {TARGET_FRAME} unavailable: {exc}",
                 throttle_duration_sec=2.0,
             )
             return None
