@@ -1,4 +1,4 @@
-# Copyright 2023 Clearpath Robotics, Inc.
+# Copyright 2022 Clearpath Robotics, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,67 +17,91 @@
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.actions import IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+    OpaqueFunction
+)
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import PushRosNamespace, SetRemap
+
+from nav2_common.launch import RewrittenYaml
+
+pkg_dis_tutorial3 = get_package_share_directory('rins_robot')
+pkg_turtlebot4_navigation = get_package_share_directory('turtlebot4_navigation')
+pkg_slam_toolbox = get_package_share_directory('slam_toolbox')
 
 ARGUMENTS = [
+    DeclareLaunchArgument('use_sim_time', default_value='false',choices=['true', 'false'],description='Use sim time'),
+    DeclareLaunchArgument('sync', default_value='true', choices=['true', 'false'],description='Use synchronous SLAM'),
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
-    DeclareLaunchArgument('rviz', default_value='true', choices=['true', 'false'], description='Start rviz.'),
-    DeclareLaunchArgument('world', default_value='task2_yellow_demo', description='Simulation World'),
-    DeclareLaunchArgument('model', default_value='standard', choices=['standard', 'lite'], description='Turtlebot4 Model'),
-    DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false'], description='use_sim_time')
+    DeclareLaunchArgument('autostart', default_value='true',choices=['true', 'false'],description='Automatically startup the slamtoolbox. Ignored when use_lifecycle_manager is true.'),  # noqa: E501
+    DeclareLaunchArgument('use_lifecycle_manager', default_value='false',choices=['true', 'false'], description='Enable bond connection during node activation'),
+    DeclareLaunchArgument('params',default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'config', 'slam.yaml']), description='Path to the SLAM Toolbox configuration file')
 ]
 
-for pose_element in ['x', 'y', 'z', 'yaw']:
-    ARGUMENTS.append(DeclareLaunchArgument(pose_element, default_value='0.0', description=f'{pose_element} component of the robot pose.'))
+
+def launch_setup(context, *args, **kwargs):
+    namespace = LaunchConfiguration('namespace')
+    sync = LaunchConfiguration('sync')
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    autostart = LaunchConfiguration('autostart')
+    use_lifecycle_manager = LaunchConfiguration('use_lifecycle_manager')
+    slam_params = LaunchConfiguration('params')
+
+    namespace_str = namespace.perform(context)
+    if (namespace_str and not namespace_str.startswith('/')):
+        namespace_str = '/' + namespace_str
+
+    launch_slam_sync = PathJoinSubstitution([pkg_slam_toolbox, 'launch', 'online_sync_launch.py'])
+    launch_slam_async = PathJoinSubstitution([pkg_slam_toolbox, 'launch', 'online_async_launch.py'])
+
+    rewritten_slam_params = RewrittenYaml(
+        source_file=slam_params,
+        root_key=namespace_str,
+        param_rewrites={
+            'map_name': namespace_str + '/map',
+            'scan_topic': namespace_str + '/scan',
+        },
+        convert_types=True,
+    )
+
+    slam = GroupAction([
+        PushRosNamespace(namespace),
+
+        SetRemap('/tf', namespace_str + '/tf'),
+        SetRemap('/tf_static', namespace_str + '/tf_static'),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(launch_slam_sync),
+            launch_arguments=[
+                ('use_sim_time', use_sim_time),
+                ('autostart', autostart),
+                ('use_lifecycle_manager', use_lifecycle_manager),
+                ('slam_params_file', rewritten_slam_params)
+            ],
+            condition=IfCondition(sync)
+        ),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(launch_slam_async),
+            launch_arguments=[
+                ('use_sim_time', use_sim_time),
+                ('autostart', autostart),
+                ('use_lifecycle_manager', use_lifecycle_manager),
+                ('slam_params_file', rewritten_slam_params)
+            ],
+            condition=UnlessCondition(sync)
+        )
+    ])
+
+    return [slam]
+
 
 def generate_launch_description():
-    # Directories
-    pkg_rins_robot = get_package_share_directory('rins_robot')
-    pkg_turtlebot4_navigation = get_package_share_directory('turtlebot4_navigation')
-    
-    # Launch Files
-    gazebo_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'sim.launch.py'])
-    robot_spawn_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'turtlebot4_spawn.launch.py'])
-    slam_toolbox_launch = PathJoinSubstitution([pkg_turtlebot4_navigation, 'launch', 'slam_toolbox.launch.py'])
-
-    #Simulator and world
-    gazebo = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([gazebo_launch]),
-        launch_arguments=[
-            ('world', LaunchConfiguration('world')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time'))
-        ]
-    )
-
-    #Spawn turtlebot in the world
-    robot_spawn = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([robot_spawn_launch]),
-        launch_arguments=[
-            ('namespace', LaunchConfiguration('namespace')),
-            ('rviz', LaunchConfiguration('rviz')),
-            ('x', LaunchConfiguration('x')),
-            ('y', LaunchConfiguration('y')),
-            ('z', LaunchConfiguration('z')),
-            ('yaw', LaunchConfiguration('yaw')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time'))
-        ]
-    )
-
-    # SLAM
-    slam = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([slam_toolbox_launch]),
-        launch_arguments=[
-            ('namespace', LaunchConfiguration('namespace')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time'))
-        ]
-    )
-
-    # Create launch description and add actions
     ld = LaunchDescription(ARGUMENTS)
-    ld.add_action(gazebo)
-    ld.add_action(robot_spawn)
-    ld.add_action(slam)
+    ld.add_action(OpaqueFunction(function=launch_setup))
     return ld
