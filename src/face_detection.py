@@ -41,6 +41,7 @@ from rins_robot.msg import FaceCoords
  
 from ultralytics import YOLO
 import torch
+import os
  
  
 # ---------------------------------------------------------------------------
@@ -48,17 +49,17 @@ import torch
 # ---------------------------------------------------------------------------
  
 # YOLO confidence threshold – increase to reduce false positives on printed faces
-CONFIDENCE_THRESHOLD   = 0.60
+CONFIDENCE_THRESHOLD   = 0.7
  
 # Depth validity range [metres].  Faces on walls are typically 0.4 – 3.5 m away.
 DEPTH_MIN_M            = 0.30
-DEPTH_MAX_M            = 4.00
+DEPTH_MAX_M            = 1.50
  
 # Median-depth sampling: half-size of the square patch around bbox centre [pixels]
 DEPTH_PATCH_HALF       = 8    # samples a 17×17 patch
  
 # Pending-stage: how many consistent hits needed before a detection is confirmed
-MINHITS                = 3
+MINHITS                = 4
  
 # Matching radius for associating a new detection with an existing pending entry [m]
 PENDING_XY_THRESHOLD   = 0.65
@@ -131,7 +132,8 @@ class detect_faces(Node):
         self.sync.registerCallback(self.rgbdCallback)
  
         # ----- YOLO model -----
-        self.model = YOLO("yolov8n.pt")
+        model_path = os.path.expanduser("~/models/yolov8n-face-lindevs.pt")
+        self.model = YOLO(model_path)
         if torch.cuda.is_available() and self.device != 'cpu':
             self.get_logger().info(f"YOLO inference on GPU {self.device} ({torch.cuda.get_device_name(0)})")
         else:
@@ -208,7 +210,7 @@ class detect_faces(Node):
             imgsz=(480, 640),   # native-ish resolution for real camera
             show=False,
             verbose=False,
-            classes=[0],        # person only
+            #classes=[0],        # person only
             device=self.device,
             conf=CONFIDENCE_THRESHOLD,
         )

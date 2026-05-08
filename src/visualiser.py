@@ -43,8 +43,8 @@ class visualizeMarkers(Node):
             return
 
         for face, id in zip(msg.points, msg.ids):
-            if id in self.faceMarkerIds: #ce je ta obraz ze markiran ignoriraj
-                 continue
+            if id not in self.faceMarkerIds:
+                self.faceMarkerIds.append(id)
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
@@ -62,7 +62,6 @@ class visualizeMarkers(Node):
             marker.color.a = 1.0
             marker.action = Marker.ADD
             marker.pose.orientation.w = 1.0
-            self.faceMarkerIds.append(id)
 
             text = Marker()
             text.header.frame_id = "map"
@@ -94,8 +93,8 @@ class visualizeMarkers(Node):
             return
 
         for ring, ring_id, color in zip(msg.points, msg.ids, msg.colors):
-            if ring_id in self.ringMarkerIds: #ce je ta ring ze markiran ignoriraj
-                 continue
+            if ring_id not in self.ringMarkerIds:
+                self.ringMarkerIds.append(ring_id)
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
@@ -113,7 +112,6 @@ class visualizeMarkers(Node):
             marker.color.a = 1.0
             marker.action = Marker.ADD
             marker.pose.orientation.w = 1.0
-            self.ringMarkerIds.append(ring_id)
 
             text = Marker()
             text.header.frame_id = "map"

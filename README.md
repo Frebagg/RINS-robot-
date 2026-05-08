@@ -20,3 +20,13 @@ ne vem ce so cist usi te koraki na enkrat obvezni ampak runna se z vsemi na enkr
 za rocno upravljanje:
 4. ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
 
+
+## NOV MODEL ZA FACE DETECTION!!!!
+Da bo delal face detection moraš prej installat nov model - koraki:
+ - moras imet install te zadeve, skoraj zagotovo ze imas: *pip install ultralytics opencv-python torch torchvision*
+ - *cd ~*
+ - *mkdir models*
+ - *cd models*
+ - *wget https://github.com/lindevs/yolov8-face/releases/download/1.0.1/yolov8n-face-lindevs.pt*
+ - To je to, zdaj bi moralo delati
+
