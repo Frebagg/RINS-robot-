@@ -33,6 +33,15 @@
   <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>irobot_create_msgs</exec_depend>
   <exec_depend>turtle_tf2_py</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>turtlebot4_navigation</exec_depend>
+  <exec_depend>irobot_create_nodes</exec_depend>
+  <exec_depend>irobot_create_common_bringup</exec_depend>
+  <exec_depend>irobot_create_gz_bringup</exec_depend>
+  <exec_depend>irobot_create_control</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>
 

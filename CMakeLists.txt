@@ -31,6 +31,7 @@ install(PROGRAMS
   src/visualiser.py
   src/speech_servicer.py
   src/robot_commander.py
+  src/arm_mover_actions.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
