@@ -38,7 +38,8 @@ from rclpy.qos import qos_profile_sensor_data
 #ZA DRUGI KROG
 from rins_robot.msg import FaceCoords
 from rins_robot.msg import RingCoords
-from rins_robot.srv import Speech
+from std_msgs import String
+#from rins_robot.srv import Speech
 import numpy as np
 
 class TaskResult(Enum):
@@ -74,8 +75,10 @@ class RobotCommander(Node):
         self.create_subscription(FaceCoords,"/face_coords",self.updateFaceCoords,10)
         self.create_subscription(RingCoords,"/ring_coords",self.updateRingCoords,10)
 
-        self.greetClient = self.create_client(Speech,"/greet_service")
-        self.sayColorClient = self.create_client(Speech,"/sayColor_service")
+        # self.greetClient = self.create_client(Speech,"/greet_service")
+        # self.sayColorClient = self.create_client(Speech,"/sayColor_service")
+
+        self.speakPublisher  = self.create_publisher(String, "/speak", 10)
 
         self.faces = []
         self.rings = []
@@ -335,7 +338,7 @@ class RobotCommander(Node):
             if not self._go_close_enough(x, y, standoff_distance=0.30, close_enough_distance=0.60):
                 continue
             
-            future = self.greetClient.call_async(request)
+            """future = self.greetClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
             time.sleep(1)
             #time.sleep(2.0)
@@ -343,7 +346,8 @@ class RobotCommander(Node):
             if response is not None and response.success == True:
                 self.info("Sucessfuly talked to a human!")
             else:
-                self.info("Failed to talk to a human!")
+                self.info("Failed to talk to a human!")"""
+            self.speakPublisher.publish(String(data="Hello, human"))
 
         #obisci ringe
         for point,id,color in ringsCopy:
@@ -355,7 +359,7 @@ class RobotCommander(Node):
             if not self._go_close_enough(x, y, standoff_distance=0.30, close_enough_distance=0.60):
                 continue
             
-            future = self.sayColorClient.call_async(request)
+            """future = self.sayColorClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
             time.sleep(1)
             #time.sleep(2.0)
@@ -363,7 +367,8 @@ class RobotCommander(Node):
             if response is not None and response.success == True:
                 self.info("Sucessfuly talked to a ring!")
             else:
-                self.info("Failed to talk to a ring!")
+                self.info("Failed to talk to a ring!")"""
+            self.speakPublisher.publish(String(data=color))
     #--------------------------------------------------------------------------
 
 def main(args=None):
