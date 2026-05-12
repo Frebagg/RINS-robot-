@@ -52,8 +52,8 @@ from tf2_ros import TransformException
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Depth validity ─────────────────────────────────────────────────────────
-DEPTH_MIN_M        = 0.30   # closer than this → sensor noise [m]
-DEPTH_MAX_M        = 2.00   # farther than this → ignore [m]
+DEPTH_MIN_M        = 0.5   # closer than this → sensor noise [m]
+DEPTH_MAX_M        = 1.2   # farther than this → ignore [m]
 
 # ── Depth-binary range (objects to segment) ───────────────────────────────
 # Rings hang from box tops slightly above camera height; keep this fairly wide

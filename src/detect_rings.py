@@ -1,921 +1,854 @@
 #!/usr/bin/env python3
-"""
-Ring detector for TurtleBot 4 with Orbbec Gemini 335L (RGB-D).
 
-Pipeline
+"""
+Ring detection node for TurtleBot4 with Gemini 355L camera (real world).
+
+Overview
 --------
-1. Subscribe to synchronized RGB image + depth image.
-2. Back-project the depth image to a (H, W, 3) XYZ array using the camera
-   intrinsics from CameraInfo.
-3. Per color (red, green, blue, black) build an HSV mask, find contours,
-   fit ellipses, keep ring-shaped ones (hollow interior check).
-4. NMS across all candidates.
-5. For each surviving ellipse: walk the LOWER rim, look up XYZ from the
-   back-projected grid (gated by the color mask).
-6. Fit a 3D circle to the rim points: SVD plane fit -> 2D circle in plane
-   via Kasa's linear least squares. Reject if radius is implausible or
-   residual is too large.
-7. Build a Pose with the circle's center and the plane's normal as the
-   approach direction (+X axis). Transform to map frame.
-8. Per-color nearest-neighbor tracking; publish PoseArray + MarkerArray
-   (sphere + arrow showing approach direction + text label).
+- Subscribes to /gemini/color/image_raw  (RGB, bgr8)
+- Subscribes to /gemini/depth/image_raw  (uint16, millimetres, aligned to colour)
+- Subscribes to /gemini/depth/camera_info (pinhole intrinsics, received once)
+- Uses ApproximateTimeSynchronizer → single callback per (RGB, depth) pair,
+  eliminating all async race conditions from the original code.
+- Detects rings via ellipse fitting on a depth-binary image.
+- Rejects FAKE rings (printed images on boxes) by checking that the centre of
+  a detected ellipse is SIGNIFICANTLY farther away than the ring perimeter –
+  a real hole-in-the-middle ring has no surface behind it at close range,
+  while a printed image has the box surface at the same depth.
+- Back-projects pixel + depth → 3-D in camera frame via pinhole intrinsics,
+  then transforms to map frame via TF2.
+- Two-stage pending → confirmed filter prevents false positive rings from
+  a single noisy frame from entering the final output.
+- Merges duplicate detections of the same physical ring; resolves colour
+  by majority vote over all confirmed hits.
+- Publishes confirmed rings on /ring_coords.
+- Displays annotated visualisation windows.
 """
 
-from __future__ import annotations
+import rclpy
+import rclpy.time
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.qos import qos_profile_sensor_data
 
-import math
-from dataclasses import dataclass, field
-from typing import Optional
+import message_filters
 
+from sensor_msgs.msg import Image, CameraInfo
+from rins_robot.msg import RingCoords
+from geometry_msgs.msg import PointStamped, Point
+
+from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
-import rclpy
-from cv_bridge import CvBridge
-from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Quaternion
-from message_filters import ApproximateTimeSynchronizer, Subscriber
-from rclpy.duration import Duration
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import ColorRGBA, Header
-from tf2_ros import Buffer, TransformException, TransformListener
-from tf2_geometry_msgs import do_transform_point
-from geometry_msgs.msg import PointStamped
-from visualization_msgs.msg import Marker, MarkerArray
 
-# ---------------------------------------------------------------------------
-# Topic names for the Gemini 335L camera on the real TurtleBot4.
-# Verify with `ros2 topic list` on the real robot if needed.
-# ---------------------------------------------------------------------------
-RGB_TOPIC = "/gemini/color/image_raw"
-DEPTH_TOPIC = "/gemini/depth/image_raw"
-INFO_TOPIC = "/gemini/color/camera_info"
-# Frame the depth image is expressed in. On the Gemini with depth aligned
-# to color (the usual default), this is the color optical frame.
-CAMERA_FRAME = "gemini_color_optical_frame"
-TARGET_FRAME = "map"
-
-# ---------------------------------------------------------------------------
-# HSV thresholds. These are starting points -- tune on the real robot using
-# the `debug/mask_<color>` topic published by this node.
-# H in OpenCV is 0..179, S/V are 0..255.
-# ---------------------------------------------------------------------------
-COLOR_RANGES: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {
-    # Red wraps around the hue circle, so it needs two ranges.
-    "red": [
-        (np.array([0, 110, 70]),   np.array([10, 255, 255])),
-        (np.array([170, 110, 70]), np.array([179, 255, 255])),
-    ],
-    "green": [
-        (np.array([40, 80, 50]),   np.array([85, 255, 255])),
-    ],
-    "blue": [
-        (np.array([95, 120, 50]),  np.array([130, 255, 255])),
-    ],
-    # Black is low V; we ignore hue. Tight S upper bound avoids picking up
-    # dark-saturated colors like deep red.
-    "black": [
-        (np.array([0, 0, 0]),      np.array([179, 80, 60])),
-    ],
-}
-
-# RGBA used for RViz markers, matched to the ring color.
-MARKER_RGBA: dict[str, tuple[float, float, float, float]] = {
-    "red":   (1.0, 0.1, 0.1, 0.9),
-    "green": (0.1, 0.9, 0.1, 0.9),
-    "blue":  (0.1, 0.3, 1.0, 0.9),
-    "black": (0.05, 0.05, 0.05, 0.95),
-}
-
-# ---------------------------------------------------------------------------
-# Detection / acceptance thresholds.
-# ---------------------------------------------------------------------------
-MIN_CONTOUR_AREA_PX = 250         # ignore tiny blobs
-MAX_AXIS_RATIO = 4.0              # rings viewed from the side -- still ellipse-like
-MIN_RING_AXIS_PX = 15             # minimum minor axis of the ellipse
-RING_HOLLOWNESS_THRESH = 0.45     # interior fill ratio must be BELOW this
-DEPTH_RIM_SAMPLES = 24            # how many points around the rim to sample
-DEPTH_MIN_M = 0.20
-DEPTH_MAX_M = 4.0
-NMS_IOU_THRESH = 0.30             # suppress overlapping ellipses above this IoU
-MIN_RIM_POINTS_3D = 6             # minimum valid 3D rim points to attempt fit
-MAX_CIRCLE_FIT_RESIDUAL_M = 0.04  # mean point-to-circle distance, reject if larger
-RING_RADIUS_MIN_M = 0.05          # plausible physical ring radius bounds
-RING_RADIUS_MAX_M = 0.25
-
-# Cluster newly-detected rings with previously-detected ones if they are
-# within this distance (in map frame). Same color only.
-ASSOCIATION_RADIUS_M = 0.35
-# If a tracked ring hasn't been seen for this long, drop it.
-TRACK_TIMEOUT_S = 60.0
-# Minimum number of detections before we trust a ring enough to publish it.
-MIN_DETECTIONS_FOR_PUBLISH = 3
+import tf2_geometry_msgs as tfg
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from tf2_ros import TransformException
 
 
-@dataclass
-class TrackedRing:
-    color: str
-    position: np.ndarray                # mean position in map frame, shape (3,)
-    orientation: Quaternion = field(default_factory=lambda: Quaternion(x=0.0, y=0.0, z=0.0, w=1.0))
-    detections: int = 1
-    last_seen_stamp: float = 0.0
-    samples: list[np.ndarray] = field(default_factory=list)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Tunable parameters  (one place to change everything)
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def update(self, new_pos: np.ndarray, stamp: float,
-               new_orientation: Optional[Quaternion] = None) -> None:
-        # Running mean -- cheap, robust enough, and behaves well with N -> inf.
-        self.samples.append(new_pos)
-        if len(self.samples) > 50:
-            self.samples.pop(0)
-        self.position = np.mean(np.stack(self.samples, axis=0), axis=0)
-        # For orientation we just take the latest -- proper averaging of
-        # quaternions needs SLERP/Markley's method and isn't worth it here,
-        # since the ring isn't moving and consecutive estimates should agree.
-        if new_orientation is not None:
-            self.orientation = new_orientation
-        self.detections += 1
-        self.last_seen_stamp = stamp
+# ── Depth validity ─────────────────────────────────────────────────────────
+DEPTH_MIN_M        = 0.30   # closer than this → sensor noise [m]
+DEPTH_MAX_M        = 1.50   # rings are within ~1 m; discard everything beyond [m]
 
+# ── Depth-binary range (objects to segment) ───────────────────────────────
+BINARY_DEPTH_MIN_M = 0.25
+BINARY_DEPTH_MAX_M = 1.50   # matches DEPTH_MAX_M
+
+# ── Morphological kernel sizes ─────────────────────────────────────────────
+MORPH_OPEN_K  = 1   # keep thin ring structures (1x1 open is effectively no-op)
+MORPH_CLOSE_K = 3   # still close small contour gaps without over-smoothing
+
+# ── Ellipse geometry filters ──────────────────────────────────────────────
+MIN_CONTOUR_PTS  = 15    # minimum contour points to attempt ellipse fit
+AXIS_RATIO_MAX   = 3.5   # max major/minor ratio (rejects very elongated ellipses)
+AXIS_MIN_PX      = 8     # minor axis must be at least this many pixels
+AXIS_MAX_PX      = 260   # major axis must be at most this many pixels (avoids huge blobs)
+# Minimum circularity: 4π·area / perimeter².  Circle = 1.0, thin arc ≈ 0.
+# Rings appear as roughly circular blobs; scene clutter (table edges, box
+# corners) tends to be elongated/angular with much lower circularity.
+MIN_CIRCULARITY  = 0.25
+
+# ── Ring hole validation ───────────────────────────────────────────────────
+# The inner ellipse used to sample the hole is this fraction of the outer one.
+INNER_SCALE           = 0.45
+# Minimum number of valid depth samples needed on the ring perimeter.
+MIN_RING_DEPTH_PTS    = 8
+# Patch half-size for centre-depth sampling [pixels]
+CENTRE_PATCH_HALF     = 5
+# Minimum number of valid depth pixels inside the centre patch.
+MIN_CENTRE_PATCH_PTS  = 2
+# Real ring: hole depth must exceed ring depth by at least this much [m].
+# Raised from 0.05 → 0.10 to sit well above Gemini 355L depth noise (~3 cm).
+# A printed image on a flat box surface has difference ≈ 0; real hole ≫ 0.10.
+HOLE_DEPTH_MARGIN_M   = 0.10
+# Fraction of hole-region pixels that must be invalid (zero / out-of-range)
+# to accept the "strong hole" path.  Raised from 0.40 → 0.60 to reduce
+# false positives from noisy scene regions that happen to have some bad pixels.
+HOLE_INVALID_FRACTION = 0.60
+
+# ── 3-D back-projection: depth sampling ───────────────────────────────────
+# Patch around ellipse centre used to compute the median ring depth for 3-D.
+BACKPROJ_PATCH_HALF  = 8   # 17×17 pixel patch
+
+# ── Two-stage confirmation ─────────────────────────────────────────────────
+PENDING_MINHITS       = 3    # hits in pending stage before promotion
+PENDING_KEEPTIME_NS   = int(4e9)   # 4 s max age for a pending candidate (was 8 s)
+
+# ── Spatial matching thresholds (map frame) [m] ───────────────────────────
+PENDING_XY_THR  = 0.55
+PENDING_Z_THR   = 0.55
+MATCH_XY_THR    = 0.65
+MATCH_Z_THR     = 0.65
+MERGE_XY_THR    = 0.45
+MERGE_Z_THR     = 0.45
+
+# ── Publishing ─────────────────────────────────────────────────────────────
+PUBLISH_MIN_HITS = 6    # confirmed ring must have this many hits to be published
+
+# ── Time synchronisation ───────────────────────────────────────────────────
+SYNC_QUEUE  = 10
+SYNC_SLOP_S = 0.08
+
+# ── Colour classification ─────────────────────────────────────────────────
+# Minimum saturation to consider a pixel "coloured" (not grey/white/black)
+COLOUR_SAT_THR = 45
+# Minimum value (brightness) – discard very dark pixels which are unreliable
+COLOUR_VAL_THR = 30
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 class RingDetector(Node):
-    def __init__(self) -> None:
-        super().__init__("ring_detector")
 
-        # Use the canonical sensor_data QoS profile -- this is what camera
-        # drivers (Orbbec, Realsense, etc.) are supposed to publish with, and
-        # it's the simplest way to guarantee we match the publisher exactly.
-        # Hand-rolling a profile (BEST_EFFORT + KEEP_LAST(5)) sometimes fails
-        # to match if the publisher uses BEST_EFFORT + KEEP_LAST(10) or has
-        # a different liveliness/deadline. Using the named profile avoids
-        # that whole class of problem.
-        from rclpy.qos import qos_profile_sensor_data
-        sensor_qos = qos_profile_sensor_data
+    def __init__(self):
+        super().__init__('ring_detector')
 
-        self.bridge = CvBridge()
-        self.tf_buffer = Buffer()
+        # ── Camera intrinsics (filled once from camera_info) ──────────────
+        self.fx = self.fy = self.cx_cam = self.cy_cam = None
+        self.camera_frame = None
+
+        # ── ROS infrastructure ────────────────────────────────────────────
+        self.bridge      = CvBridge()
+        self.tf_buffer   = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Camera intrinsics -- filled in by the CameraInfo callback.
-        self.fx: Optional[float] = None
-        self.fy: Optional[float] = None
-        self.cx: Optional[float] = None
-        self.cy: Optional[float] = None
+        sensor_qos = qos_profile_sensor_data
 
-        # CameraInfo is no longer required for back-projection (the point
-        # cloud has XYZ baked in), but we keep it because it's lightweight
-        # and useful if you ever want to re-add a fallback path.
-        self.create_subscription(
-            CameraInfo, INFO_TOPIC, self._on_camera_info, sensor_qos
-        )
+        self.info_sub = self.create_subscription(
+            CameraInfo, '/gemini/depth/camera_info',
+            self._camera_info_cb, sensor_qos)
 
-        # Time-synchronized RGB + depth image.
-        # We use the depth image rather than the point cloud topic because
-        # the Orbbec driver doesn't always publish a cloud (and when it does
-        # the topic name varies). Depth + CameraInfo carries the same info
-        # and is universally available.
-        self.rgb_sub = Subscriber(self, Image, RGB_TOPIC, qos_profile=sensor_qos)
-        self.depth_sub = Subscriber(self, Image, DEPTH_TOPIC, qos_profile=sensor_qos)
-        self.sync = ApproximateTimeSynchronizer(
-            [self.rgb_sub, self.depth_sub],
-            queue_size=30,
-            slop=0.5,
-        )
-        self.sync.registerCallback(self._on_frames)
+        # Synchronised RGB + depth
+        self._rgb_sub   = message_filters.Subscriber(
+            self, Image, '/gemini/color/image_raw',  qos_profile=sensor_qos)
+        self._depth_sub = message_filters.Subscriber(
+            self, Image, '/gemini/depth/image_raw',  qos_profile=sensor_qos)
+        self._sync = message_filters.ApproximateTimeSynchronizer(
+            [self._rgb_sub, self._depth_sub],
+            queue_size=SYNC_QUEUE, slop=SYNC_SLOP_S)
+        self._sync.registerCallback(self._rgbd_cb)
 
-        # Diagnostic counters for the "synchronizer never fires" failure mode.
-        # We tap each topic with a plain subscription so we can see ticks
-        # independently of the synchronizer.
-        self._rgb_ticks = 0
-        self._depth_ticks = 0
-        self._sync_ticks = 0
-        self.create_subscription(
-            Image, RGB_TOPIC, self._tick_rgb, sensor_qos
-        )
-        self.create_subscription(
-            Image, DEPTH_TOPIC, self._tick_depth, sensor_qos
-        )
-        self.create_timer(2.0, self._diag_log)
+        # ── Tracking state ────────────────────────────────────────────────
+        # pending:   [(Point[map], hit_count, last_seen, color_votes:dict), ...]
+        # confirmed: [(ring_id, Point[map], hit_count, last_seen, color_votes:dict), ...]
+        self.pending   = []
+        self.confirmed = []
+        self.next_id   = 1
 
-        # Publishers.
-        self.poses_pub = self.create_publisher(PoseArray, "rings/poses", 10)
-        self.markers_pub = self.create_publisher(MarkerArray, "rings/markers", 10)
-        self.debug_pub = self.create_publisher(Image, "rings/debug_image", 1)
-        self.mask_pubs = {
-            color: self.create_publisher(Image, f"rings/debug/mask_{color}", 1)
-            for color in COLOR_RANGES
+        # ── Rejection diagnostics (aggregated, logged once per second) ───
+        self._rej_stats = {
+            'frames': 0,
+            'contours': 0,
+            'candidates': 0,
+            'accepted': 0,
+            'rej_contour_pts': 0,
+            'rej_circularity': 0,
+            'rej_axis_invalid': 0,
+            'rej_ratio': 0,
+            'rej_size': 0,
+            'rej_hole': 0,
+            'rej_color': 0,
+            'rej_depth': 0,
+            'rej_tf': 0,
+            'rej_nonfinite': 0,
         }
+        self._last_rej_log_ns = self.get_clock().now().nanoseconds
 
-        # tracks[color] -> list[TrackedRing]
-        self.tracks: dict[str, list[TrackedRing]] = {c: [] for c in COLOR_RANGES}
+        # ── Publisher ─────────────────────────────────────────────────────
+        self.coord_pub = self.create_publisher(RingCoords, '/ring_coords', 10)
+        self.create_timer(1.0 / 5.0, self._publish_cb)
 
-        # Periodic publish of stable rings -- decoupled from frame rate so RViz
-        # keeps showing markers even if no new frames arrive.
-        self.create_timer(0.5, self._publish_state)
+        # ── Visualisation windows ─────────────────────────────────────────
+        cv2.namedWindow('Ring detector – RGB',    cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Ring detector – Binary', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Ring detector – Depth',  cv2.WINDOW_NORMAL)
 
+        self.get_logger().info('RingDetector initialised – waiting for camera_info…')
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Camera info
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _camera_info_cb(self, msg: CameraInfo):
+        if self.fx is not None:
+            return
+        k = msg.k
+        self.fx, self.fy       = k[0], k[4]
+        self.cx_cam, self.cy_cam = k[2], k[5]
+        self.camera_frame        = msg.header.frame_id
         self.get_logger().info(
-            f"Ring detector up. RGB={RGB_TOPIC}  DEPTH={DEPTH_TOPIC}  "
-            f"camera_frame={CAMERA_FRAME}  target_frame={TARGET_FRAME}"
-        )
+            f'Camera info: fx={self.fx:.1f} fy={self.fy:.1f} '
+            f'cx={self.cx_cam:.1f} cy={self.cy_cam:.1f}  frame={self.camera_frame}')
+        self.destroy_subscription(self.info_sub)
 
-    # -----------------------------------------------------------------------
-    # Subscribers
-    # -----------------------------------------------------------------------
-    def _on_camera_info(self, msg: CameraInfo) -> None:
-        # K = [fx 0 cx; 0 fy cy; 0 0 1]
+    # ──────────────────────────────────────────────────────────────────────
+    # Main synchronised callback
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _rgbd_cb(self, rgb_msg: Image, depth_msg: Image):
         if self.fx is None:
-            self.get_logger().info("Got CameraInfo, locking intrinsics.")
-        self.fx = float(msg.k[0])
-        self.fy = float(msg.k[4])
-        self.cx = float(msg.k[2])
-        self.cy = float(msg.k[5])
-
-    # --- diagnostics -------------------------------------------------------
-    def _tick_rgb(self, msg: Image) -> None:
-        self._rgb_ticks += 1
-        self._last_rgb_stamp = msg.header.stamp
-
-    def _tick_depth(self, msg: Image) -> None:
-        self._depth_ticks += 1
-        self._last_depth_stamp = msg.header.stamp
-
-    def _diag_log(self) -> None:
-        if self._sync_ticks > 0:
-            return
-
-        rgb_t = getattr(self, "_last_rgb_stamp", None)
-        depth_t = getattr(self, "_last_depth_stamp", None)
-        if rgb_t is None and depth_t is None:
             self.get_logger().warn(
-                "No RGB and no depth messages seen yet. "
-                f"Check `ros2 topic list` for {RGB_TOPIC} and {DEPTH_TOPIC}.",
-                throttle_duration_sec=4.0,
-            )
-            return
-        if rgb_t is None:
-            self.get_logger().warn(
-                f"Depth ticking ({self._depth_ticks}) but no RGB on "
-                f"{RGB_TOPIC}.",
-                throttle_duration_sec=4.0,
-            )
-            return
-        if depth_t is None:
-            self.get_logger().warn(
-                f"RGB ticking ({self._rgb_ticks}) but no depth on "
-                f"{DEPTH_TOPIC}. Check `ros2 topic list | grep depth`.",
-                throttle_duration_sec=4.0,
-            )
+                'Waiting for camera_info…', throttle_duration_sec=5.0)
             return
 
-        rgb_s = rgb_t.sec + rgb_t.nanosec * 1e-9
-        depth_s = depth_t.sec + depth_t.nanosec * 1e-9
-        delta = depth_s - rgb_s
-        self.get_logger().warn(
-            f"Both topics tick (rgb={self._rgb_ticks}, depth={self._depth_ticks}) "
-            f"but synchronizer hasn't fired. Latest stamp delta "
-            f"(depth - rgb) = {delta:.3f}s. If large, check use_sim_time "
-            "or raise slop further.",
-            throttle_duration_sec=4.0,
-        )
+        self._rej_stats['frames'] += 1
 
-    def _on_frames(self, rgb_msg: Image, depth_msg: Image) -> None:
-        self._sync_ticks += 1
-        if self.fx is None:
-            return  # need intrinsics to back-project depth into XYZ
-
+        # ── Decode ────────────────────────────────────────────────────────
         try:
-            rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
-        except Exception as exc:
-            self.get_logger().warn(f"RGB conversion failed: {exc}")
+            rgb   = self.bridge.imgmsg_to_cv2(rgb_msg,   'bgr8')
+            depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        except CvBridgeError as e:
+            self.get_logger().error(f'CvBridge: {e}')
             return
 
-        try:
-            depth_raw = self.bridge.imgmsg_to_cv2(
-                depth_msg, desired_encoding="passthrough"
-            )
-        except Exception as exc:
-            self.get_logger().warn(f"Depth conversion failed: {exc}")
-            return
+        # Gemini 355L depth is uint16 millimetres.
+        # Median blur on the raw uint16 removes salt-and-pepper noise while
+        # preserving edges better than a Gaussian would.
+        depth_raw = cv2.medianBlur(depth_raw, 5)
 
-        # Normalize depth to meters. Depth can be 16UC1 (mm) or 32FC1 (m).
-        if depth_raw.dtype == np.uint16:
-            depth_m = depth_raw.astype(np.float32) / 1000.0
-        else:
-            depth_m = depth_raw.astype(np.float32)
+        depth_m = depth_raw.astype(np.float32) / 1000.0
+        depth_m[~np.isfinite(depth_m)] = 0.0
 
-        # Build a (H, W, 3) XYZ image from depth + intrinsics. This is the
-        # exact same data that an organized point cloud would carry, just
-        # synthesized client-side instead of in the driver.
-        xyz = self._depth_to_xyz_image(depth_m)
+        # Hard clamp: anything beyond DEPTH_MAX_M is irrelevant (rings are
+        # within ~1 m) and only adds noise to contour finding.
+        depth_m[depth_m > DEPTH_MAX_M] = 0.0
 
-        debug = rgb.copy()
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV)
-        h, w = rgb.shape[:2]
+        h_rgb, w_rgb = rgb.shape[:2]
+        h_dep, w_dep = depth_m.shape[:2]
 
-        # 1) Collect candidates across all colors. NMS later resolves overlaps.
-        candidates: list[dict] = []
-        for color, ranges in COLOR_RANGES.items():
-            mask = self._build_mask(hsv, ranges)
-            self._publish_mask(color, mask, rgb_msg.header)
+        # Rings are hung on a wall above the floor — blank out the lower half
+        # of the depth image to eliminate floor/base clutter entirely.
+        depth_m[h_dep // 2:, :] = 0.0
 
-            for ellipse, hollowness in self._find_ring_ellipses(mask):
-                (_, _), (axa, axb), _ = ellipse
-                area = math.pi * (axa / 2.0) * (axb / 2.0)
-                score = hollowness * math.sqrt(max(area, 1.0))
-                candidates.append({
-                    "color": color,
-                    "ellipse": ellipse,
-                    "hollowness": hollowness,
-                    "score": score,
-                    "mask": mask,
-                })
+        # ── Build depth-binary segmentation mask ─────────────────────────
+        valid = (depth_m > DEPTH_MIN_M) & (depth_m < DEPTH_MAX_M)
+        binary = np.zeros(depth_m.shape, dtype=np.uint8)
+        binary[valid & (depth_m > BINARY_DEPTH_MIN_M) & (depth_m < BINARY_DEPTH_MAX_M)] = 255
 
-        # 2) NMS across colors.
-        kept = self._nms_ellipses(candidates, (h, w), NMS_IOU_THRESH)
+        ko = np.ones((MORPH_OPEN_K,  MORPH_OPEN_K),  dtype=np.uint8)
+        kc = np.ones((MORPH_CLOSE_K, MORPH_CLOSE_K), dtype=np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  ko)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kc)
 
-        # 3) For each survivor, fit a 3D circle to the rim points.
-        for det in kept:
-            fit = self._fit_ring_3d(det["ellipse"], xyz, det["mask"])
-            if fit is None:
-                continue
-            center_cam, normal_cam, radius_m, residual_m = fit
+        # ── Find contours and fit ellipses ────────────────────────────────
+        # RETR_TREE: retrieve full hierarchy so we can check that a candidate
+        # contour actually contains a child (the hole inside the ring).  A real
+        # ring in a binary depth image has its outer edge as a parent contour
+        # with at least one child contour representing the inner hole edge.
+        # Flat printed rings and random blobs typically have NO child contours.
+        contours, hierarchy = cv2.findContours(
+            binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-            pose_cam = self._build_pose_from_center_normal(
-                center_cam, normal_cam, frame_id=CAMERA_FRAME
-            )
-            pose_map = self._to_target_frame_pose(
-                pose_cam, rgb_msg.header.stamp, source_frame=CAMERA_FRAME
-            )
-            if pose_map is None:
+        candidates = []   # (ellipse_in_depth_coords, ellipse_in_rgb_coords)
+        raw_ellipses_rgb = []
+
+        scale_x = w_rgb / w_dep
+        scale_y = h_rgb / h_dep
+
+        for idx, cnt in enumerate(contours):
+            self._rej_stats['contours'] += 1
+            if cnt.shape[0] < MIN_CONTOUR_PTS:
+                self._rej_stats['rej_contour_pts'] += 1
                 continue
 
-            pos_map = np.array([
-                pose_map.position.x, pose_map.position.y, pose_map.position.z
-            ], dtype=np.float64)
-            self._associate_or_create(det["color"], pos_map, rgb_msg.header.stamp,
-                                      orientation=pose_map.orientation)
-            self._draw_detection(debug, det["ellipse"], det["color"],
-                                 det["hollowness"], radius_m, residual_m)
-
-        # Publish debug overlay.
-        try:
-            debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")
-            debug_msg.header = rgb_msg.header
-            self.debug_pub.publish(debug_msg)
-        except Exception as exc:
-            self.get_logger().warn(f"Debug publish failed: {exc}")
-
-    # -----------------------------------------------------------------------
-    # Color & shape detection
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _build_mask(hsv: np.ndarray, ranges: list[tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in ranges:
-            mask |= cv2.inRange(hsv, lo, hi)
-
-        # Morphology: close small gaps in the rim, then open to kill speckle.
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        return mask
-
-    @staticmethod
-    def _ellipse_mask(ellipse, shape: tuple[int, int]) -> np.ndarray:
-        m = np.zeros(shape, dtype=np.uint8)
-        cv2.ellipse(m, ellipse, 255, thickness=-1)
-        return m
-
-    @classmethod
-    def _nms_ellipses(
-        cls,
-        candidates: list[dict],
-        shape: tuple[int, int],
-        iou_thresh: float,
-    ) -> list[dict]:
-        """
-        Greedy NMS over ellipse candidates.
-
-        IoU is computed exactly via filled-ellipse rasters -- ellipses don't
-        have a closed-form IoU like axis-aligned boxes, and approximating with
-        bounding boxes loses too much info for thin/rotated rings.
-        Cost is fine: a handful of small uint8 ops per pair, and we only have
-        a few candidates per frame in practice.
-        """
-        if not candidates:
-            return []
-
-        # Sort high-score first; greedy NMS keeps the best and suppresses overlaps.
-        order = sorted(candidates, key=lambda d: d["score"], reverse=True)
-        masks = [cls._ellipse_mask(d["ellipse"], shape) for d in order]
-        areas = [int(np.count_nonzero(m)) for m in masks]
-
-        kept: list[dict] = []
-        suppressed = [False] * len(order)
-        for i in range(len(order)):
-            if suppressed[i]:
+            # ── Circularity filter ────────────────────────────────────────
+            area      = cv2.contourArea(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter < 1e-3:
+                self._rej_stats['rej_circularity'] += 1
                 continue
-            kept.append(order[i])
-            for j in range(i + 1, len(order)):
-                if suppressed[j]:
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+            if circularity < MIN_CIRCULARITY:
+                self._rej_stats['rej_circularity'] += 1
+                continue
+
+            ellipse_dep = cv2.fitEllipse(cnt)
+            ax1, ax2 = ellipse_dep[1]
+            if ax1 <= 0 or ax2 <= 0:
+                self._rej_stats['rej_axis_invalid'] += 1
+                continue
+            major = max(ax1, ax2)
+            minor = min(ax1, ax2)
+            ratio = major / minor
+            if ratio > AXIS_RATIO_MAX:
+                self._rej_stats['rej_ratio'] += 1
+                continue
+            if minor < AXIS_MIN_PX or major > AXIS_MAX_PX:
+                self._rej_stats['rej_size'] += 1
+                continue
+
+            # ── Topology check: real ring should have a child contour ─────
+            # hierarchy shape: (1, N, 4)  → [next, prev, first_child, parent]
+            has_child = (hierarchy[0][idx][2] != -1)
+            if not has_child:
+                # No inner hole contour found.  Still allow if depth hole check
+                # passes strongly (the ring may be too small / close for the
+                # inner edge to form a separate contour), but count the miss.
+                self.get_logger().debug(
+                    f'Contour {idx}: no child contour (topology miss); continuing to depth check')
+
+            # ── Fake-ring rejection via depth hole check ──────────────────
+            if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
+                self._rej_stats['rej_hole'] += 1
+                continue
+
+            # Scale ellipse centre & axes to RGB image coordinates
+            cx_d, cy_d = ellipse_dep[0]
+            ax1_d, ax2_d = ellipse_dep[1]
+            ellipse_rgb = (
+                (cx_d * scale_x, cy_d * scale_y),
+                (ax1_d * scale_x, ax2_d * scale_y),
+                ellipse_dep[2]
+            )
+
+            candidates.append((ellipse_dep, ellipse_rgb))
+            self._rej_stats['candidates'] += 1
+            raw_ellipses_rgb.append(ellipse_dep)   # for yellow candidate overlay
+
+        # ── Visualisation ─────────────────────────────────────────────────
+        vis   = rgb.copy()
+        depth_vis = self._depth_to_gray(depth_m)
+
+        now   = self.get_clock().now()
+        stamp = rgb_msg.header.stamp
+
+        for ellipse_dep, ellipse_rgb in candidates:
+            # Colour classification on RGB image using scaled ellipse
+            color_name = self._classify_color(rgb, ellipse_rgb)
+            if color_name == 'unknown':
+                self._rej_stats['rej_color'] += 1
+                self.get_logger().debug('Colour classification uncertain; keeping candidate as unknown')
+
+            # 3-D localisation via back-projection.
+            # Use the RING PERIMETER depth (material surface), not the hole
+            # centre depth (which is air/background and will give wrong 3-D).
+            cx_d = int(round(ellipse_dep[0][0]))
+            cy_d = int(round(ellipse_dep[0][1]))
+
+            perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
+            valid_pd = perim_depths[
+                np.isfinite(perim_depths) &
+                (perim_depths > DEPTH_MIN_M) &
+                (perim_depths < DEPTH_MAX_M)]
+
+            if len(valid_pd) >= MIN_RING_DEPTH_PTS:
+                depth_val = float(np.median(valid_pd))
+            else:
+                # Fallback: small patch around ellipse centre (may be the hole,
+                # but at least gives a rough estimate so we don't throw away
+                # valid rings that are partially occluded).
+                depth_val = self._sample_depth_patch(depth_m, cx_d, cy_d)
+                if depth_val is None:
+                    self._rej_stats['rej_depth'] += 1
                     continue
-                inter = int(np.count_nonzero(cv2.bitwise_and(masks[i], masks[j])))
-                union = areas[i] + areas[j] - inter
-                if union <= 0:
-                    continue
-                if inter / union > iou_thresh:
-                    suppressed[j] = True
-        return kept
 
-    def _find_ring_ellipses(self, mask: np.ndarray):
-        """
-        Yield (ellipse, hollowness) for contours that look like rings.
-
-        The key trick: a ring's bounding ellipse should have a mostly EMPTY
-        interior. We measure 'hollowness' as the fraction of the ellipse's
-        interior that is masked. Filled disks fail this test.
-        """
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        h, w = mask.shape
-
-        for cnt in contours:
-            if cv2.contourArea(cnt) < MIN_CONTOUR_AREA_PX:
+            point_cam = self._backproject(cx_d, cy_d, depth_val)
+            point_map = self._to_map(point_cam, self.camera_frame, stamp)
+            if point_map is None:
+                self._rej_stats['rej_tf'] += 1
                 continue
-            if len(cnt) < 5:
-                continue  # fitEllipse needs >=5 points
 
+            mx, my, mz = point_map.point.x, point_map.point.y, point_map.point.z
+            if not np.isfinite([mx, my, mz]).all():
+                self._rej_stats['rej_nonfinite'] += 1
+                continue
+
+            # Update tracking
+            self._update_tracking(mx, my, mz, color_name, now)
+            self._rej_stats['accepted'] += 1
+
+            # Draw on visualisation
             try:
-                ellipse = cv2.fitEllipse(cnt)
-            except cv2.error:
-                continue
+                cv2.ellipse(vis, ellipse_rgb, (0, 255, 0), 2)
+            except Exception:
+                pass
+            cx_v = int(round(ellipse_rgb[0][0]))
+            cy_v = int(round(ellipse_rgb[0][1]))
+            cv2.circle(vis, (cx_v, cy_v), 4, (0, 0, 255), -1)
+            cv2.putText(vis, f'{color_name} d={depth_val:.2f}m',
+                        (cx_v + 8, cy_v),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
-            (_, _), (axis_a, axis_b), _ = ellipse
-            minor = min(axis_a, axis_b)
-            major = max(axis_a, axis_b)
-            if minor < MIN_RING_AXIS_PX:
-                continue
-            if major / max(minor, 1e-3) > MAX_AXIS_RATIO:
-                continue
+        # ── Housekeeping ──────────────────────────────────────────────────
+        self._remove_stale_pending(now)
+        self._merge_confirmed()
+        self._maybe_log_rejection_summary(now)
 
-            # Hollowness check: compare a filled-ellipse mask vs. the actual mask.
-            filled = np.zeros_like(mask)
-            cv2.ellipse(filled, ellipse, 255, thickness=-1)
-            interior_area = float(np.count_nonzero(filled))
-            if interior_area <= 0:
-                continue
-            overlap = float(np.count_nonzero(cv2.bitwise_and(filled, mask)))
-            fill_ratio = overlap / interior_area
-            if fill_ratio > RING_HOLLOWNESS_THRESH:
-                # Looks like a filled disk, not a ring.
-                continue
+        # HUD
+        n_pub = sum(1 for _, _, c, _, _ in self.confirmed if c >= PUBLISH_MIN_HITS)
+        cv2.putText(vis,
+                    f'Confirmed rings: {n_pub}  |  Pending: {len(self.pending)}',
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(vis,
+                    f'Confirmed rings: {n_pub}  |  Pending: {len(self.pending)}',
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 0, 0), 1, cv2.LINE_AA)
 
-            # Hollowness here is "how empty the interior is" -- bigger == ringier.
-            hollowness = 1.0 - fill_ratio
-            yield ellipse, hollowness
+        cv2.imshow('Ring detector – RGB',    vis)
+        cv2.imshow('Ring detector – Binary', binary)
+        cv2.imshow('Ring detector – Depth',  depth_vis)
+        key = cv2.waitKey(1)
+        if key == 27:
+            rclpy.shutdown()
 
-    # -----------------------------------------------------------------------
-    # 3D estimation (point-cloud based)
-    # -----------------------------------------------------------------------
-    def _depth_to_xyz_image(self, depth_m: np.ndarray) -> np.ndarray:
+    # ──────────────────────────────────────────────────────────────────────
+    # Fake-ring rejection  ← THE CRITICAL CHECK
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _ellipse_has_real_hole(self, depth_m: np.ndarray, ellipse) -> bool:
         """
-        Back-project a depth image to a (H, W, 3) array of XYZ in camera frame.
+        Returns True only if the ellipse looks like a REAL ring with a physical
+        hole, not a printed image on a box surface.
 
-        For each pixel (u, v) with depth z:
-            X = (u - cx) * z / fx
-            Y = (v - cy) * z / fy
-            Z = z
-
-        This is the inverse of the pinhole projection. Vectorized over the
-        full image with numpy meshgrid -- a couple of multiplications per
-        pixel, runs in single-digit ms for VGA depth.
-
-        Pixels with z==0 (driver convention for "no return") or out of our
-        usable depth band become NaN, so np.isfinite filters them downstream.
+        Strategy
+        --------
+        1. Sample depth values on the perimeter of the outer ellipse → ring_depth.
+        2. Sample a patch of depth values inside a scaled-down inner ellipse
+           (the hole region) → hole_depths.
+        3. Accept as real hole when:
+           a) There are enough valid ring-perimeter samples.
+           b) EITHER: hole has mostly invalid/infinite depth (robot sees air/far
+              wall through the hole) → strong signal of a real hole.
+              OR: median hole depth > ring depth + HOLE_DEPTH_MARGIN_M (hole
+              region is farther away → real hole looking at the far background).
+           c) Reject if hole depth ≈ ring depth (flat printed surface).
         """
-        h, w = depth_m.shape
-        # Cache the (u-cx)/fx and (v-cy)/fy grids once -- they only depend on
-        # intrinsics and image size, not on the depth values.
-        if not hasattr(self, "_unproj_cache") or self._unproj_cache[0] != (h, w):
-            us = np.arange(w, dtype=np.float32)
-            vs = np.arange(h, dtype=np.float32)
-            uu, vv = np.meshgrid(us, vs)
-            x_per_z = (uu - self.cx) / self.fx
-            y_per_z = (vv - self.cy) / self.fy
-            self._unproj_cache = ((h, w), x_per_z, y_per_z)
-        _, x_per_z, y_per_z = self._unproj_cache
+        h, w = depth_m.shape[:2]
 
-        z = depth_m
-        valid = (z > DEPTH_MIN_M) & (z < DEPTH_MAX_M) & np.isfinite(z)
+        # 1. Ring perimeter depth
+        perim = self._perimeter_depths(depth_m, ellipse)
+        valid_perim = perim[
+            np.isfinite(perim) &
+            (perim > DEPTH_MIN_M) &
+            (perim < DEPTH_MAX_M)]
+        if len(valid_perim) < MIN_RING_DEPTH_PTS:
+            self.get_logger().debug(
+                f'_ellipse_has_real_hole: insufficient perimeter depth samples ({len(valid_perim)})')
+            return False
+        ring_depth = float(np.median(valid_perim))
 
-        xyz = np.full((h, w, 3), np.nan, dtype=np.float32)
-        # Only fill valid pixels; the rest stay NaN.
-        xyz[..., 0] = np.where(valid, x_per_z * z, np.nan)
-        xyz[..., 1] = np.where(valid, y_per_z * z, np.nan)
-        xyz[..., 2] = np.where(valid, z, np.nan)
-        return xyz
-
-    def _fit_ring_3d(
-        self,
-        ellipse,
-        xyz: np.ndarray,
-        color_mask: np.ndarray,
-    ) -> Optional[tuple[np.ndarray, np.ndarray, float, float]]:
-        """
-        Walk the ellipse rim, gather 3D rim points from the cloud (filtered
-        by the color mask), and fit a 3D circle.
-
-        Returns (center_cam, normal_cam, radius_m, residual_m), or None.
-            center_cam:  (3,) ring center in camera frame
-            normal_cam:  (3,) unit normal of the ring's plane
-            radius_m:    fitted physical radius
-            residual_m:  mean point-to-circle distance (lower = better fit)
-        """
-        (cx_px, cy_px), (axis_a, axis_b), angle_deg = ellipse
-        h, w = xyz.shape[:2]
-        a = axis_a / 2.0
-        b = axis_b / 2.0
-        ang = math.radians(angle_deg)
-        cos_a, sin_a = math.cos(ang), math.sin(ang)
-
-        rim_pts: list[np.ndarray] = []
-        n_samples = DEPTH_RIM_SAMPLES * 2
-        for i in range(n_samples):
-            t = 2.0 * math.pi * i / n_samples
-            x_local = a * math.cos(t)
-            y_local = b * math.sin(t)
-            u = int(round(cx_px + x_local * cos_a - y_local * sin_a))
-            v = int(round(cy_px + x_local * sin_a + y_local * cos_a))
-            if not (0 <= u < w and 0 <= v < h):
-                continue
-            # Lower-half preference -- the hanger arm contaminates the top.
-            if v < cy_px + 0.15 * b:
-                continue
-            # Mask gate: only accept where the rim is actually colored.
-            u0, u1 = max(0, u - 1), min(w, u + 2)
-            v0, v1 = max(0, v - 1), min(h, v + 2)
-            if not np.any(color_mask[v0:v1, u0:u1]):
-                continue
-            # Pull XYZ from the 3x3 patch and pick the point closest to the
-            # camera that's in valid range. Closest, because if any pixel in
-            # the patch saw the rim (foreground) and others saw what's behind
-            # (background), the rim is the smaller Z value. This is the
-            # equivalent of the masked-min trick on a depth image, but exact.
-            patch = xyz[v0:v1, u0:u1].reshape(-1, 3)
-            valid = np.isfinite(patch).all(axis=1)
-            valid &= (patch[:, 2] > DEPTH_MIN_M) & (patch[:, 2] < DEPTH_MAX_M)
-            if not np.any(valid):
-                continue
-            cand = patch[valid]
-            # Closest by Z within the patch -- foreground wins ties.
-            best_idx = int(np.argmin(cand[:, 2]))
-            rim_pts.append(cand[best_idx])
-
-        if len(rim_pts) < MIN_RIM_POINTS_3D:
-            return None
-
-        pts = np.stack(rim_pts, axis=0)  # (N, 3)
-
-        # Fit a plane to the rim points (the ring lies in a plane).
-        # Use SVD on the centered points -- the smallest singular vector is
-        # the plane normal. Robust to outliers within reason; if you need more,
-        # wrap this in RANSAC.
-        centroid = pts.mean(axis=0)
-        centered = pts - centroid
-        # SVD: V[-1] is the direction of least variance == plane normal.
+        # 2. Inner (hole) region sampling
+        inner_ellipse = (
+            ellipse[0],
+            (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
+            ellipse[2]
+        )
+        # Draw the inner ellipse mask
+        mask_inner = np.zeros((h, w), dtype=np.uint8)
         try:
-            _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        except np.linalg.LinAlgError:
+            cv2.ellipse(mask_inner, inner_ellipse, 255, thickness=-1)
+        except Exception:
+            self.get_logger().debug('_ellipse_has_real_hole: failed to draw inner ellipse mask')
+            return False
+
+        ys, xs = np.where(mask_inner > 0)
+        if len(ys) == 0:
+            self.get_logger().debug('_ellipse_has_real_hole: inner ellipse produced no pixels')
+            return False
+
+        hole_raw = depth_m[ys, xs]
+
+        # Pixels with zero depth (sensor returns 0 for no-return = air/glass)
+        # and finite-but-out-of-range are both "hole evidence"
+        n_total   = len(hole_raw)
+        n_invalid = int(np.sum(
+            (hole_raw == 0) |
+            ~np.isfinite(hole_raw) |
+            (hole_raw < DEPTH_MIN_M)
+        ))
+
+        invalid_fraction = n_invalid / n_total if n_total > 0 else 1.0
+
+        # Strong hole signal: most pixels in the hole region have no depth return
+        # (looking through the air at a far wall, or outside the sensor range)
+        if invalid_fraction >= HOLE_INVALID_FRACTION:
+            return True
+
+        # Moderate signal: hole depth is measurably farther than ring surface
+        valid_hole = hole_raw[
+            np.isfinite(hole_raw) &
+            (hole_raw > DEPTH_MIN_M) &
+            (hole_raw < DEPTH_MAX_M)]
+
+        if len(valid_hole) < MIN_CENTRE_PATCH_PTS:
+            # Not enough valid readings in hole → treat as invalid (can't tell)
+            # but since invalid_fraction was < 0.55 there were readings → reject
+            self.get_logger().debug(
+                f'_ellipse_has_real_hole: insufficient hole depth samples ({len(valid_hole)}), invalid_fraction={invalid_fraction:.2f}')
+            return False
+
+        hole_depth = float(np.median(valid_hole))
+        is_real = hole_depth > ring_depth + HOLE_DEPTH_MARGIN_M
+        if not is_real:
+            self.get_logger().debug(
+                f'_ellipse_has_real_hole: rejected as fake-like (hole_depth={hole_depth:.2f}, ring_depth={ring_depth:.2f}, margin={HOLE_DEPTH_MARGIN_M:.2f})')
+        return is_real
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Ellipse helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _perimeter_depths(self, depth_m: np.ndarray, ellipse,
+                          delta_deg: int = 8) -> np.ndarray:
+        """Sample depth values around the outer ellipse perimeter."""
+        h, w = depth_m.shape[:2]
+        cx  = int(round(ellipse[0][0]))
+        cy  = int(round(ellipse[0][1]))
+        ax1 = max(1, int(round(ellipse[1][0] / 2.0)))
+        ax2 = max(1, int(round(ellipse[1][1] / 2.0)))
+        ang = int(round(ellipse[2]))
+
+        pts = cv2.ellipse2Poly((cx, cy), (ax1, ax2), ang, 0, 360, delta_deg)
+        if pts is None or len(pts) == 0:
+            return np.array([], dtype=np.float32)
+        xs = np.clip(pts[:, 0], 0, w - 1)
+        ys = np.clip(pts[:, 1], 0, h - 1)
+        return depth_m[ys, xs]
+
+    def _sample_depth_patch(self, depth_m: np.ndarray,
+                            cx: int, cy: int) -> float | None:
+        """
+        Return median valid depth from a small patch around (cx, cy).
+        Used to get a robust depth estimate at the ring centre for 3-D
+        back-projection (we use the ring's own depth, not the hole depth).
+        Here we actually want the ring material depth, so we sample a ring-
+        band patch rather than the dead centre – use the perimeter average
+        instead (called as fallback in the main loop).
+        For the primary estimate we sample a patch at the ellipse centre
+        displaced slightly toward the ring material, but for simplicity we
+        just take a small patch and pick valid, near values (ring surface).
+        """
+        h, w = depth_m.shape[:2]
+        r = BACKPROJ_PATCH_HALF
+        y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+        if y1 <= y0 or x1 <= x0:
             return None
-        normal = vh[-1]
-        normal = normal / (np.linalg.norm(normal) + 1e-9)
+        patch = depth_m[y0:y1, x0:x1]
+        valid = patch[(patch > DEPTH_MIN_M) & (patch < DEPTH_MAX_M) &
+                      np.isfinite(patch)]
+        if len(valid) < 4:
+            return None
+        return float(np.median(valid))
 
-        # Project points onto the plane (2D coords in the plane) so we can
-        # do a 2D circle fit -- much simpler than fitting in 3D directly.
-        # Build an orthonormal basis (u_hat, v_hat) spanning the plane.
-        # Pick u_hat as any vector orthogonal to the normal.
-        if abs(normal[0]) < 0.9:
-            u_hat = np.cross(normal, np.array([1.0, 0.0, 0.0]))
-        else:
-            u_hat = np.cross(normal, np.array([0.0, 1.0, 0.0]))
-        u_hat = u_hat / (np.linalg.norm(u_hat) + 1e-9)
-        v_hat = np.cross(normal, u_hat)
+    # ──────────────────────────────────────────────────────────────────────
+    # Colour classification
+    # ──────────────────────────────────────────────────────────────────────
 
-        pts_2d = np.stack(
-            [centered @ u_hat, centered @ v_hat], axis=1
-        )  # (N, 2)
+    def _classify_color(self, bgr: np.ndarray, ellipse) -> str:
+        """
+        Classify the colour of a ring from the BGR image.
 
-        # 2D circle fit (Kasa method): solve the linear system
-        #   2*xc*x + 2*yc*y + (R^2 - xc^2 - yc^2) = x^2 + y^2
-        # Let c = R^2 - xc^2 - yc^2; the unknowns are (xc, yc, c).
-        x = pts_2d[:, 0]
-        y = pts_2d[:, 1]
-        A = np.stack([2 * x, 2 * y, np.ones_like(x)], axis=1)  # (N, 3)
-        rhs = x * x + y * y
+        Steps
+        -----
+        1. Build a ring-band mask (outer ellipse minus inner ellipse).
+        2. Convert to HSV.
+        3. Discard very dark pixels (shadows, depth holes casting shade).
+        4. Separate chromatic from achromatic pixels.
+        5. Use median hue of chromatic pixels, or brightness for achromatic.
+        """
+        h, w = bgr.shape[:2]
+
+        # Build ring-band mask in RGB coordinates
+        inner_ell = (
+            ellipse[0],
+            (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
+            ellipse[2]
+        )
+        mask_outer = np.zeros((h, w), dtype=np.uint8)
+        mask_inner = np.zeros((h, w), dtype=np.uint8)
         try:
-            sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
-        except np.linalg.LinAlgError:
-            return None
-        xc_2d, yc_2d, c = sol
-        r2 = c + xc_2d * xc_2d + yc_2d * yc_2d
-        if r2 <= 0:
-            return None
-        radius = float(math.sqrt(r2))
+            cv2.ellipse(mask_outer, ellipse,    255, thickness=-1)
+            cv2.ellipse(mask_inner, inner_ell,  255, thickness=-1)
+        except Exception:
+            return 'unknown'
+        ring_mask = cv2.subtract(mask_outer, mask_inner)
 
-        # Reject implausible radii -- ring hoops are roughly known.
-        if not (RING_RADIUS_MIN_M <= radius <= RING_RADIUS_MAX_M):
-            return None
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        px  = hsv[ring_mask > 0]
 
-        # Residual: mean distance from each point to the fitted circle.
-        # In-plane distance from each (x, y) to (xc, yc), minus the radius.
-        dx = x - xc_2d
-        dy = y - yc_2d
-        radial = np.sqrt(dx * dx + dy * dy)
-        residual = float(np.mean(np.abs(radial - radius)))
-        if residual > MAX_CIRCLE_FIT_RESIDUAL_M:
-            return None
+        if len(px) < 20:
+            return 'unknown'
 
-        # Lift the 2D center back to 3D camera frame.
-        center_cam = centroid + xc_2d * u_hat + yc_2d * v_hat
+        # Discard very dark pixels – unreliable hue
+        px = px[px[:, 2] > COLOUR_VAL_THR]
+        if len(px) < 10:
+            return 'unknown'
 
-        return center_cam, normal, radius, residual
+        sat = px[:, 1]
+        val = px[:, 2]
+        hue = px[:, 0]
 
-    @staticmethod
-    def _build_pose_from_center_normal(
-        center_cam: np.ndarray,
-        normal_cam: np.ndarray,
-        frame_id: str = CAMERA_FRAME,
-    ) -> PoseStamped:
-        """
-        Build a PoseStamped (in camera frame) where the orientation's +X axis
-        points along the ring's normal.
+        chromatic = px[sat > COLOUR_SAT_THR]
 
-        Convention choice: aligning +X with the normal means a robot looking at
-        a "PoseStamped from this ring" knows which way is "out of the ring."
-        That's the natural direction to approach from for grabbing or passing
-        through it. If your nav stack expects a different convention (e.g. +Z
-        is approach direction, common in manipulation), change the basis below.
-        """
-        # Pick a stable up vector that's not parallel to the normal so we can
-        # build a full orthonormal frame. World up in camera frame would be
-        # nicer but we don't have TF here -- just pick any non-parallel vec.
-        up = np.array([0.0, -1.0, 0.0])  # camera "up" in optical frame
-        if abs(np.dot(up, normal_cam)) > 0.95:
-            up = np.array([1.0, 0.0, 0.0])
+        if len(chromatic) < 10:
+            # Achromatic rings: only black is allowed.
+            med_v = float(np.median(val))
+            if med_v < 55:
+                return 'black'
+            return 'unknown'
 
-        x_axis = normal_cam / (np.linalg.norm(normal_cam) + 1e-9)
-        z_axis = np.cross(x_axis, up)
-        z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-9)
-        y_axis = np.cross(z_axis, x_axis)
+        # Use median hue of chromatic pixels
+        # OpenCV H range: 0–179
+        # Red wraps around 0/179 – handle with circular median trick
+        h_vals = chromatic[:, 0].astype(np.float32)
 
-        # Rotation matrix [x y z] -> quaternion (Hamilton convention, w last
-        # because that's what geometry_msgs uses).
-        R = np.stack([x_axis, y_axis, z_axis], axis=1)  # columns are basis vecs
-        q = RingDetector._mat_to_quat(R)
+        # Shift reds above 170 to negative so the circular wrap is handled
+        h_shifted = np.where(h_vals > 170, h_vals - 180.0, h_vals)
+        med_h = float(np.median(h_shifted))
+        if med_h < 0:
+            med_h += 180.0
 
-        ps = PoseStamped()
+        if   med_h <  8  or med_h >= 172: return 'red'
+        elif med_h < 22:                  return 'orange'
+        elif med_h < 38:                  return 'yellow'
+        elif med_h < 88:                  return 'green'
+        elif med_h < 130:                 return 'blue'
+        elif med_h < 172:                 return 'purple'
+
+        return 'unknown'
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3-D geometry
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _backproject(self, u: int, v: int, depth_m: float) -> np.ndarray:
+        """Pinhole back-projection: pixel (u,v) + depth → camera-frame XYZ."""
+        X = (u - self.cx_cam) * depth_m / self.fx
+        Y = (v - self.cy_cam) * depth_m / self.fy
+        return np.array([X, Y, depth_m], dtype=float)
+
+    def _to_map(self, point_cam: np.ndarray,
+                frame_id: str, stamp) -> PointStamped | None:
+        """Transform a camera-frame 3-D point to the map frame via TF2."""
+        ps = PointStamped()
         ps.header.frame_id = frame_id
-        ps.pose.position.x = float(center_cam[0])
-        ps.pose.position.y = float(center_cam[1])
-        ps.pose.position.z = float(center_cam[2])
-        ps.pose.orientation.x = float(q[0])
-        ps.pose.orientation.y = float(q[1])
-        ps.pose.orientation.z = float(q[2])
-        ps.pose.orientation.w = float(q[3])
-        return ps
+        ps.header.stamp    = stamp
+        ps.point.x = float(point_cam[0])
+        ps.point.y = float(point_cam[1])
+        ps.point.z = float(point_cam[2])
 
-    @staticmethod
-    def _mat_to_quat(R: np.ndarray) -> np.ndarray:
-        """3x3 rotation matrix to quaternion (x, y, z, w). Shepperd's method."""
-        m = R
-        tr = m[0, 0] + m[1, 1] + m[2, 2]
-        if tr > 0:
-            s = math.sqrt(tr + 1.0) * 2
-            w = 0.25 * s
-            x = (m[2, 1] - m[1, 2]) / s
-            y = (m[0, 2] - m[2, 0]) / s
-            z = (m[1, 0] - m[0, 1]) / s
-        elif (m[0, 0] > m[1, 1]) and (m[0, 0] > m[2, 2]):
-            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2
-            w = (m[2, 1] - m[1, 2]) / s
-            x = 0.25 * s
-            y = (m[0, 1] + m[1, 0]) / s
-            z = (m[0, 2] + m[2, 0]) / s
-        elif m[1, 1] > m[2, 2]:
-            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2
-            w = (m[0, 2] - m[2, 0]) / s
-            x = (m[0, 1] + m[1, 0]) / s
-            y = 0.25 * s
-            z = (m[1, 2] + m[2, 1]) / s
-        else:
-            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2
-            w = (m[1, 0] - m[0, 1]) / s
-            x = (m[0, 2] + m[2, 0]) / s
-            y = (m[1, 2] + m[2, 1]) / s
-            z = 0.25 * s
-        return np.array([x, y, z, w], dtype=np.float64)
+        timeout     = Duration(seconds=0.15)
+        source_time = rclpy.time.Time.from_msg(stamp)
 
-    def _to_target_frame_pose(
-        self,
-        pose_cam: PoseStamped,
-        stamp,
-        source_frame: str = CAMERA_FRAME,
-    ) -> Optional[Pose]:
-        """Transform a PoseStamped from `source_frame` into TARGET_FRAME."""
         try:
             tf = self.tf_buffer.lookup_transform(
-                TARGET_FRAME,
-                source_frame,
-                stamp,
-                timeout=Duration(seconds=0.2),
-            )
-        except TransformException as exc:
-            self.get_logger().warn(
-                f"TF {source_frame} -> {TARGET_FRAME} unavailable: {exc}",
-                throttle_duration_sec=2.0,
-            )
+                'map', frame_id, source_time, timeout)
+            return tfg.do_transform_point(ps, tf)
+        except TransformException as te:
+            err = str(te).lower()
+            if ('extrapolation' in err or 'future' in err or
+                    'lookup would require' in err):
+                try:
+                    tf = self.tf_buffer.lookup_transform(
+                        'map', frame_id, rclpy.time.Time(), timeout)
+                    return tfg.do_transform_point(ps, tf)
+                except TransformException as te2:
+                    self.get_logger().debug(f'TF fallback failed: {te2}')
+                    return None
+            self.get_logger().debug(f'TF failed: {te}')
             return None
 
-        # Transform position via PointStamped (we already have that machinery)
-        # and orientation by composing quaternions.
-        from tf2_geometry_msgs import do_transform_pose
-        pose_cam.header.stamp = stamp
-        try:
-            out = do_transform_pose(pose_cam.pose, tf)
-        except Exception as exc:
-            self.get_logger().warn(f"do_transform_pose failed: {exc}")
-            return None
-        return out
-
-    # -----------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
     # Tracking
-    # -----------------------------------------------------------------------
-    def _associate_or_create(
-        self,
-        color: str,
-        pos_map: np.ndarray,
-        stamp,
-        orientation: Optional[Quaternion] = None,
-    ) -> None:
-        stamp_s = stamp.sec + stamp.nanosec * 1e-9
-        bucket = self.tracks[color]
-        # Find nearest existing track of the same color.
-        best: Optional[TrackedRing] = None
-        best_d = float("inf")
-        for t in bucket:
-            d = float(np.linalg.norm(t.position - pos_map))
-            if d < best_d:
-                best_d = d
-                best = t
-        if best is not None and best_d < ASSOCIATION_RADIUS_M:
-            best.update(pos_map, stamp_s, new_orientation=orientation)
-        else:
-            new_track = TrackedRing(
-                color=color,
-                position=pos_map.copy(),
-                orientation=orientation if orientation is not None
-                             else Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
-                samples=[pos_map.copy()],
-                last_seen_stamp=stamp_s,
-            )
-            bucket.append(new_track)
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _gc_tracks(self, now_s: float) -> None:
-        for color, bucket in self.tracks.items():
-            self.tracks[color] = [
-                t for t in bucket if (now_s - t.last_seen_stamp) < TRACK_TIMEOUT_S
-            ]
-
-    # -----------------------------------------------------------------------
-    # Publishing
-    # -----------------------------------------------------------------------
-    def _publish_state(self) -> None:
-        now = self.get_clock().now()
-        now_s = now.nanoseconds * 1e-9
-        self._gc_tracks(now_s)
-
-        header = Header()
-        header.stamp = now.to_msg()
-        header.frame_id = TARGET_FRAME
-
-        poses = PoseArray()
-        poses.header = header
-        markers = MarkerArray()
-
-        # Always publish a DELETEALL first so removed tracks vanish in RViz.
-        clear = Marker()
-        clear.header = header
-        clear.action = Marker.DELETEALL
-        markers.markers.append(clear)
-
-        marker_id = 0
-        for color, bucket in self.tracks.items():
-            for t in bucket:
-                if t.detections < MIN_DETECTIONS_FOR_PUBLISH:
-                    continue
-
-                pose = Pose()
-                pose.position = Point(x=float(t.position[0]),
-                                      y=float(t.position[1]),
-                                      z=float(t.position[2]))
-                pose.orientation = t.orientation
-                poses.poses.append(pose)
-
-                r, g, b, a = MARKER_RGBA[color]
-
-                sphere = Marker()
-                sphere.header = header
-                sphere.ns = f"ring_{color}"
-                sphere.id = marker_id
-                marker_id += 1
-                sphere.type = Marker.SPHERE
-                sphere.action = Marker.ADD
-                sphere.pose = pose
-                sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.18
-                sphere.color = ColorRGBA(r=r, g=g, b=b, a=a)
-                sphere.lifetime = Duration(seconds=2).to_msg()
-                markers.markers.append(sphere)
-
-                # Arrow showing the ring's approach direction (its plane normal,
-                # mapped to +X by _build_pose_from_center_normal). Useful for
-                # checking that the orientation makes sense in RViz.
-                arrow = Marker()
-                arrow.header = header
-                arrow.ns = f"ring_normal_{color}"
-                arrow.id = marker_id
-                marker_id += 1
-                arrow.type = Marker.ARROW
-                arrow.action = Marker.ADD
-                arrow.pose = pose
-                arrow.scale.x = 0.30  # length
-                arrow.scale.y = 0.04
-                arrow.scale.z = 0.04
-                arrow.color = ColorRGBA(r=r, g=g, b=b, a=0.7)
-                arrow.lifetime = Duration(seconds=2).to_msg()
-                markers.markers.append(arrow)
-
-                label = Marker()
-                label.header = header
-                label.ns = f"ring_label_{color}"
-                label.id = marker_id
-                marker_id += 1
-                label.type = Marker.TEXT_VIEW_FACING
-                label.action = Marker.ADD
-                label.pose = Pose()
-                label.pose.position = Point(x=float(t.position[0]),
-                                            y=float(t.position[1]),
-                                            z=float(t.position[2]) + 0.15)
-                label.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-                label.scale.z = 0.12
-                label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-                label.text = f"{color} (n={t.detections})"
-                label.lifetime = Duration(seconds=2).to_msg()
-                markers.markers.append(label)
-
-        self.poses_pub.publish(poses)
-        self.markers_pub.publish(markers)
-
-    def _publish_mask(self, color: str, mask: np.ndarray, header: Header) -> None:
-        try:
-            msg = self.bridge.cv2_to_imgmsg(mask, encoding="mono8")
-            msg.header = header
-            self.mask_pubs[color].publish(msg)
-        except Exception as exc:
-            self.get_logger().warn(f"Mask publish failed for {color}: {exc}")
-
-    # -----------------------------------------------------------------------
-    # Debug drawing
-    # -----------------------------------------------------------------------
     @staticmethod
-    def _draw_detection(img: np.ndarray, ellipse, color: str, hollowness: float,
-                        radius_m: float = 0.0, residual_m: float = 0.0) -> None:
-        bgr = {
-            "red":   (0, 0, 255),
-            "green": (0, 255, 0),
-            "blue":  (255, 0, 0),
-            "black": (60, 60, 60),
-        }[color]
-        cv2.ellipse(img, ellipse, bgr, 2)
-        (cx_px, cy_px), _, _ = ellipse
-        label = f"{color} h={hollowness:.2f} r={radius_m*100:.0f}cm res={residual_m*1000:.0f}mm"
-        cv2.putText(
-            img,
-            label,
-            (int(cx_px) - 80, int(cy_px) - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            bgr,
-            1,
-            cv2.LINE_AA,
+    def _xy_dist(ax, ay, bx, by) -> float:
+        return float(np.hypot(ax - bx, ay - by))
+
+    def _update_tracking(self, x, y, z, color, now):
+        """Route a new map-frame detection through the pending/confirmed pipeline."""
+        # 1. Try to associate with a confirmed ring
+        if self._hit_confirmed(x, y, z, color, now):
+            return
+        # 2. Otherwise update / create a pending candidate
+        self._hit_pending(x, y, z, color, now)
+
+    def _hit_confirmed(self, x, y, z, color, now) -> bool:
+        best_i, best_d = -1, float('inf')
+        for i, (ring_id, pt, count, last_seen, votes) in enumerate(self.confirmed):
+            d_xy = self._xy_dist(pt.x, pt.y, x, y)
+            d_z  = abs(pt.z - z)
+            if d_xy <= MATCH_XY_THR and d_z <= MATCH_Z_THR and d_xy < best_d:
+                best_d = d_xy
+                best_i = i
+        if best_i < 0:
+            return False
+
+        ring_id, pt, count, _, votes = self.confirmed[best_i]
+        # Weighted running mean
+        w   = 1.0 / (count + 1)
+        pt.x = pt.x * (1 - w) + x * w
+        pt.y = pt.y * (1 - w) + y * w
+        pt.z = pt.z * (1 - w) + z * w
+        votes[color] = votes.get(color, 0) + 1
+        self.confirmed[best_i] = (ring_id, pt, count + 1, now, votes)
+        return True
+
+    def _hit_pending(self, x, y, z, color, now):
+        best_i, best_d = -1, float('inf')
+        for i, (pt, count, last_seen, votes) in enumerate(self.pending):
+            d_xy = self._xy_dist(pt.x, pt.y, x, y)
+            d_z  = abs(pt.z - z)
+            if d_xy <= PENDING_XY_THR and d_z <= PENDING_Z_THR and d_xy < best_d:
+                best_d = d_xy
+                best_i = i
+
+        if best_i >= 0:
+            pt, count, _, votes = self.pending[best_i]
+            w   = 1.0 / (count + 1)
+            pt.x = pt.x * (1 - w) + x * w
+            pt.y = pt.y * (1 - w) + y * w
+            pt.z = pt.z * (1 - w) + z * w
+            votes[color] = votes.get(color, 0) + 1
+            count += 1
+            self.pending[best_i] = (pt, count, now, votes)
+
+            if count >= PENDING_MINHITS:
+                best_color = max(votes, key=votes.get)
+                self.get_logger().info(
+                    f'Ring confirmed! id={self.next_id} color={best_color} '
+                    f'map=({pt.x:.2f},{pt.y:.2f},{pt.z:.2f})')
+                self.confirmed.append((self.next_id, pt, count, now, votes))
+                self.next_id += 1
+                del self.pending[best_i]
+            return
+
+        # Brand-new candidate
+        p = Point()
+        p.x, p.y, p.z = float(x), float(y), float(z)
+        self.pending.append((p, 1, now, {color: 1}))
+
+    def _remove_stale_pending(self, now):
+        self.pending = [
+            (pt, c, t, v) for pt, c, t, v in self.pending
+            if max(0, (now - t).nanoseconds) <= PENDING_KEEPTIME_NS
+        ]
+
+    def _merge_confirmed(self):
+        """Merge confirmed rings that ended up too close to each other."""
+        if len(self.confirmed) < 2:
+            return
+        merged = []
+        used   = set()
+        for i in range(len(self.confirmed)):
+            if i in used:
+                continue
+            id_i, pt_i, c_i, t_i, v_i = self.confirmed[i]
+            for j in range(i + 1, len(self.confirmed)):
+                if j in used:
+                    continue
+                id_j, pt_j, c_j, t_j, v_j = self.confirmed[j]
+                if (self._xy_dist(pt_i.x, pt_i.y, pt_j.x, pt_j.y) <= MERGE_XY_THR
+                        and abs(pt_i.z - pt_j.z) <= MERGE_Z_THR):
+                    total = c_i + c_j
+                    pt_i.x = (pt_i.x * c_i + pt_j.x * c_j) / total
+                    pt_i.y = (pt_i.y * c_i + pt_j.y * c_j) / total
+                    pt_i.z = (pt_i.z * c_i + pt_j.z * c_j) / total
+                    c_i = total
+                    t_i = t_i if t_i > t_j else t_j
+                    id_i = min(id_i, id_j)
+                    for col, cnt in v_j.items():
+                        v_i[col] = v_i.get(col, 0) + cnt
+                    used.add(j)
+                    self.get_logger().info(
+                        f'Merged confirmed ring {id_j} → {id_i}')
+            merged.append((id_i, pt_i, c_i, t_i, v_i))
+        self.confirmed = merged
+
+    def _maybe_log_rejection_summary(self, now):
+        """Log aggregate rejection diagnostics once per second."""
+        now_ns = now.nanoseconds
+        if now_ns - self._last_rej_log_ns < int(1e9):
+            return
+
+        s = self._rej_stats
+        self.get_logger().info(
+            'Reject summary (1s): '
+            f'frames={s["frames"]} contours={s["contours"]} candidates={s["candidates"]} accepted={s["accepted"]} '
+            f'contour_pts={s["rej_contour_pts"]} circ={s["rej_circularity"]} axis={s["rej_axis_invalid"]} ratio={s["rej_ratio"]} '
+            f'size={s["rej_size"]} hole={s["rej_hole"]} color={s["rej_color"]} depth={s["rej_depth"]} '
+            f'tf={s["rej_tf"]} nonfinite={s["rej_nonfinite"]}'
         )
 
+        for key in s:
+            s[key] = 0
+        self._last_rej_log_ns = now_ns
 
-def main(args=None) -> None:
-    rclpy.init(args=args)
+    # ──────────────────────────────────────────────────────────────────────
+    # Publisher
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _publish_cb(self):
+        msg = RingCoords()
+        for ring_id, pt, count, _, votes in self.confirmed:
+            if count < PUBLISH_MIN_HITS:
+                continue
+            if not np.isfinite([pt.x, pt.y, pt.z]).all():
+                continue
+            best_color = max(votes, key=votes.get)
+            msg.ids.append(ring_id)
+            msg.points.append(pt)
+            msg.colors.append(best_color)
+        self.coord_pub.publish(msg)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Visualisation helper
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _depth_to_gray(self, depth_m: np.ndarray) -> np.ndarray:
+        d = depth_m.copy()
+        d[~np.isfinite(d)] = 0.0
+        d[(d < DEPTH_MIN_M) | (d > DEPTH_MAX_M)] = 0.0
+        out   = np.zeros(d.shape, dtype=np.uint8)
+        valid = d[d > 0]
+        if len(valid) == 0:
+            return out
+        mn, mx = np.min(valid), np.max(valid)
+        if mx - mn < 1e-6:
+            return out
+        norm = (d - mn) / (mx - mn)
+        norm[d == 0] = 1.0
+        return (norm * 255).astype(np.uint8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    rclpy.init(args=None)
     node = RingDetector()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
