@@ -155,6 +155,32 @@ NEIGHBOURHOOD_DEPTH_BUCKETS = (
     (1.0, 99.0, 3),   # far:       small kernel
 )
 
+# ── Binary-mask cleanup ───────────────────────────────────────────────────
+# After the depth + color-consistency masks have been combined, we do one
+# more pass: remove any "on" pixel whose KxK neighbourhood is mostly "off".
+# This kills isolated speckle and thin tendrils that survived earlier
+# stages, without using morphological erosion (which would also eat the
+# rim's inner/outer edges). Tune K bigger for more aggressive cleanup.
+BINARY_CLEANUP_K        = 5
+BINARY_CLEANUP_MIN_FRAC = 0.50
+
+# ── Canny edge pipeline (experimental) ────────────────────────────────────
+# When USE_CANNY=True the segmentation switches from "filled region of
+# same-color same-depth surface" to "1-px-wide edges where intensity
+# changes sharply, gated by depth band". Different way of finding rings,
+# useful for partially-occluded rims because edges don't need closed
+# filled regions to detect.
+#
+# Canny's two thresholds: pixels with gradient > HI are strong edges,
+# pixels in [LO, HI] are kept only if connected to a strong edge.
+# Standard rule of thumb: LO ~ HI/2 or HI/3.
+USE_CANNY     = True
+CANNY_LO      = 40
+CANNY_HI      = 120
+# After detecting edges we usually want a slight dilation so close-but-not-
+# touching arc fragments merge into one contour. Set to 0 to disable.
+CANNY_DILATE_PX = 1
+
 # ── Colour classification ─────────────────────────────────────────────────
 # Minimum saturation to consider a pixel "coloured" (not grey/white/black)
 COLOUR_SAT_THR = 45
@@ -177,13 +203,12 @@ COLOR_RANGES_HSV = {
 }
 
 # A rim is classified as color X if at least this fraction of rim pixels
-# fall within X's HSV ranges. 0.60 is strict -- a ring's rim must be
-# clearly and consistently the target color, with leeway only for rim
-# shadows, specular highlights, and depth-vs-RGB parallax. Tune DOWN if
-# real rings are being rejected (the most likely cause is parallax under
-# ~30 cm where the rim mask drifts off the actual rim pixels). Tune UP
-# if false positives leak through.
-COLOR_DOMINANCE_THR = 0.60
+# fall within X's HSV ranges. Was 0.60 when this was the primary filter;
+# now that _ring_color_mask pre-filters pixels at segmentation time, the
+# rim check only needs to confirm a consistent color identity, not
+# rediscover it. 0.30 is permissive but still rejects rims that are a
+# random mix of all four ring colors (= probably not a ring at all).
+COLOR_DOMINANCE_THR = 0.30
 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -309,21 +334,66 @@ class RingDetector(Node):
         # of the depth image to eliminate floor/base clutter entirely.
         depth_m[h_dep // 2:, :] = 0.0
 
-        # ── Build depth-binary segmentation mask ─────────────────────────
-        valid = (depth_m > DEPTH_MIN_M) & (depth_m < DEPTH_MAX_M)
-        binary = np.zeros(depth_m.shape, dtype=np.uint8)
-        binary[valid & (depth_m > BINARY_DEPTH_MIN_M) & (depth_m < BINARY_DEPTH_MAX_M)] = 255
-
-        # ── AND with neighbourhood color+depth consistency mask ──────────
-        # A pixel survives only if its neighbourhood mostly agrees on BOTH
-        # color and depth. Kernel size scales inversely with depth so the
-        # window stays smaller than the ring rim at every distance.
-        # Built at depth resolution so it lines up with the depth-binary
-        # mask above. See NEIGHBOURHOOD_* constants for tuning.
         rgb_at_dep_res = cv2.resize(rgb, (w_dep, h_dep),
                                     interpolation=cv2.INTER_AREA)
-        cc_mask = self._neighbourhood_color_consistency(rgb_at_dep_res, depth_m)
-        binary = cv2.bitwise_and(binary, cc_mask)
+
+        if USE_CANNY:
+            # ── Canny pipeline ────────────────────────────────────────────
+            # Run Canny on the grayscale RGB-at-depth-resolution image,
+            # then AND with the depth band so we only keep edges in the
+            # ring depth range. This is a fundamentally different
+            # segmentation from the region-based pipeline below: instead
+            # of "filled regions of uniform surface", we get "1-px-wide
+            # gradient edges in the right depth band".
+            #
+            # Why this is interesting: edges don't require closed filled
+            # regions, so a ring whose rim is partially occluded (by the
+            # hanger arm, by lighting, by motion blur) can still produce
+            # a usable arc that fitEllipse handles. The downside is
+            # everything else with sharp intensity changes also produces
+            # edges -- text on whiteboards, poster borders, shadows. The
+            # depth gate is what makes this tractable in a classroom.
+            gray = cv2.cvtColor(rgb_at_dep_res, cv2.COLOR_BGR2GRAY)
+            # Light blur first to suppress sub-pixel noise -- Canny is
+            # very sensitive to gradient strength, and blurring smooths
+            # out one-pixel speckle that would otherwise produce edges.
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(gray, CANNY_LO, CANNY_HI)
+
+            # Depth gate: only keep edges in the ring depth band.
+            in_band = (depth_m > BINARY_DEPTH_MIN_M) & (depth_m < BINARY_DEPTH_MAX_M)
+            edges = cv2.bitwise_and(edges, (in_band.astype(np.uint8) * 255))
+
+            # Optional dilation to connect close arc fragments. Canny gives
+            # 1-px wide edges, and if a rim is broken into 3 arcs each with
+            # a 1-px gap, dilating by 1 px bridges them into one contour
+            # that fitEllipse can use.
+            if CANNY_DILATE_PX > 0:
+                k = 2 * CANNY_DILATE_PX + 1
+                edges = cv2.dilate(edges,
+                                   np.ones((k, k), dtype=np.uint8))
+            binary = edges
+        else:
+            # ── Region-based pipeline (the working version) ──────────────
+            valid = (depth_m > DEPTH_MIN_M) & (depth_m < DEPTH_MAX_M)
+            binary = np.zeros(depth_m.shape, dtype=np.uint8)
+            binary[valid & (depth_m > BINARY_DEPTH_MIN_M) & (depth_m < BINARY_DEPTH_MAX_M)] = 255
+
+            cc_mask = self._neighbourhood_color_consistency(rgb_at_dep_res, depth_m)
+            binary = cv2.bitwise_and(binary, cc_mask)
+
+            # Ring-color pixel filter (commented out in color-agnostic mode):
+            # ring_color_mask = self._ring_color_mask(rgb_at_dep_res)
+            # binary = cv2.bitwise_and(binary, ring_color_mask)
+
+        # ── Cleanup pass: drop "on" pixels with sparse "on" neighbourhood ─
+        # Soft alternative to morphological erosion. Erosion would remove a
+        # pixel that doesn't have *all* its KxK neighbours on; this drops
+        # a pixel that doesn't have at least BINARY_CLEANUP_MIN_FRAC of
+        # them on. Cleaner edges, kills isolated speckle and thin tendrils
+        # without eroding both sides of the rim.
+        binary = self._sparse_neighbourhood_cleanup(
+            binary, BINARY_CLEANUP_K, BINARY_CLEANUP_MIN_FRAC)
 
         ko = np.ones((MORPH_OPEN_K,  MORPH_OPEN_K),  dtype=np.uint8)
         kc = np.ones((MORPH_CLOSE_K, MORPH_CLOSE_K), dtype=np.uint8)
@@ -351,6 +421,14 @@ class RingDetector(Node):
                 self._rej_stats['rej_contour_pts'] += 1
                 continue
 
+            # ── COLOR-AGNOSTIC MODE ───────────────────────────────────────
+            # Geometric filters (circularity / axis / ratio / size) ARE
+            # enabled -- they're pure shape checks, no color hardcoding.
+            # Hole check is disabled (classroom backgrounds make it
+            # unreliable, see chat history).
+            # Color rejection at the rim-classifier is also disabled; we
+            # call _classify_color only for labeling.
+
             # ── Circularity filter ────────────────────────────────────────
             area      = cv2.contourArea(cnt)
             perimeter = cv2.arcLength(cnt, True)
@@ -362,11 +440,16 @@ class RingDetector(Node):
                 self._rej_stats['rej_circularity'] += 1
                 continue
 
-            ellipse_dep = cv2.fitEllipse(cnt)
+            try:
+                ellipse_dep = cv2.fitEllipse(cnt)
+            except cv2.error:
+                continue
             ax1, ax2 = ellipse_dep[1]
             if ax1 <= 0 or ax2 <= 0:
                 self._rej_stats['rej_axis_invalid'] += 1
                 continue
+
+            # ── Axis ratio / size filters ─────────────────────────────────
             major = max(ax1, ax2)
             minor = min(ax1, ax2)
             ratio = major / minor
@@ -377,20 +460,13 @@ class RingDetector(Node):
                 self._rej_stats['rej_size'] += 1
                 continue
 
-            # ── Topology check: real ring should have a child contour ─────
-            # hierarchy shape: (1, N, 4)  → [next, prev, first_child, parent]
-            has_child = (hierarchy[0][idx][2] != -1)
-            if not has_child:
-                # No inner hole contour found.  Still allow if depth hole check
-                # passes strongly (the ring may be too small / close for the
-                # inner edge to form a separate contour), but count the miss.
-                self.get_logger().debug(
-                    f'Contour {idx}: no child contour (topology miss); continuing to depth check')
+            # # ── Topology check (disabled) ─────────────────────────────────
+            # has_child = (hierarchy[0][idx][2] != -1)
 
-            # ── Fake-ring rejection via depth hole check ──────────────────
-            if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
-                self._rej_stats['rej_hole'] += 1
-                continue
+            # # ── Fake-ring rejection via depth hole check (disabled) ──────
+            # if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
+            #     self._rej_stats['rej_hole'] += 1
+            #     continue
 
             # Scale ellipse centre & axes to RGB image coordinates
             cx_d, cy_d = ellipse_dep[0]
@@ -413,14 +489,14 @@ class RingDetector(Node):
         stamp = rgb_msg.header.stamp
 
         for ellipse_dep, ellipse_rgb in candidates:
-            # Color classification + gate. _classify_color returns 'unknown'
-            # when no registered color dominates the rim -- this is how we
-            # reject the hanger arm and any other non-ring objects that
-            # otherwise pass the geometric / hole filters.
+            # ── DIAGNOSTIC MODE: color check disabled ─────────────────────
+            # Normally an 'unknown' rim color would reject the candidate
+            # here. With filters off, we accept anyway and just tag it.
+            # Restore behaviour by uncommenting the `continue` below.
             color_name = self._classify_color(rgb, ellipse_rgb)
             if color_name == 'unknown':
                 self._rej_stats['rej_color'] += 1
-                continue   # actual rejection, not just a tag
+                # continue   # would reject in normal mode
 
             # 3-D localisation via back-projection.
             # Use the RING PERIMETER depth (material surface), not the hole
@@ -623,6 +699,62 @@ class RingDetector(Node):
         valid_center = (depth_m > 0.0) & np.isfinite(depth_m)
 
         keep = min_frac_ok & enough_valid & valid_center
+        return (keep.astype(np.uint8)) * 255
+
+    @staticmethod
+    def _ring_color_mask(bgr: np.ndarray) -> np.ndarray:
+        """
+        Build a binary mask of pixels that match ANY of the registered ring
+        colors (COLOR_RANGES_HSV: red, green, blue, black).
+
+        Used as a pixel-level filter: anything that isn't one of the four
+        target colors gets dropped at segmentation time, so it never even
+        reaches contour-finding. This is cheap (one inRange per HSV range,
+        OR'd together) and dramatically reduces the search space when the
+        scene contains lots of non-ring colors -- which a classroom always
+        does.
+
+        Note: this is intentionally permissive (a pixel matching ANY ring
+        color survives). The job of identifying *which* color a particular
+        ring is happens later in _classify_color, which looks at the
+        dominant color in the rim annulus.
+        """
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        out = np.zeros((h, w), dtype=np.uint8)
+        for _color, ranges in COLOR_RANGES_HSV.items():
+            for lo, hi in ranges:
+                out |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8),
+                                        np.array(hi, dtype=np.uint8))
+        return out
+
+    @staticmethod
+    def _sparse_neighbourhood_cleanup(
+        binary: np.ndarray, K: int, min_frac: float
+    ) -> np.ndarray:
+        """
+        Remove pixels from a binary mask whose KxK neighbourhood is mostly
+        off. This is a softer version of morphological erosion: erosion
+        removes a pixel if ANY neighbour is off; this removes a pixel only
+        if the FRACTION of "on" neighbours is below `min_frac`.
+
+        Implementation: a normalized box filter on the (uint8 / 255) mask
+        produces, per pixel, the fraction of "on" pixels in its KxK window.
+        Threshold at min_frac, AND with the original mask (we never turn
+        off-pixels on -- this is cleanup, not dilation).
+
+        Equivalent to: count = cv2.boxFilter(mask, sum, K) ; keep where
+        mask is on AND count >= min_frac * K * K.
+        """
+        # Box filter on uint8 returns mean by default when normalize=True.
+        # Mask values are 0 or 255; the mean is 255 * (on_fraction).
+        # So thresholding at 255 * min_frac gives "fraction of on >= min_frac".
+        mean = cv2.boxFilter(binary, ddepth=-1, ksize=(K, K),
+                             normalize=True, borderType=cv2.BORDER_REPLICATE)
+        thr = int(round(255 * min_frac))
+        # Pixel keeps its "on" status iff it was on AND its neighbourhood
+        # is dense enough. We don't turn off pixels on.
+        keep = (binary > 0) & (mean >= thr)
         return (keep.astype(np.uint8)) * 255
 
     # ──────────────────────────────────────────────────────────────────────

@@ -186,13 +186,12 @@ COLOR_RANGES_HSV = {
 }
 
 # A rim is classified as color X if at least this fraction of rim pixels
-# fall within X's HSV ranges. 0.60 is strict -- a ring's rim must be
-# clearly and consistently the target color, with leeway only for rim
-# shadows, specular highlights, and depth-vs-RGB parallax. Tune DOWN if
-# real rings are being rejected (the most likely cause is parallax under
-# ~30 cm where the rim mask drifts off the actual rim pixels). Tune UP
-# if false positives leak through.
-COLOR_DOMINANCE_THR = 0.60
+# fall within X's HSV ranges. Was 0.60 when this was the primary filter;
+# now that _ring_color_mask pre-filters pixels at segmentation time, the
+# rim check only needs to confirm a consistent color identity, not
+# rediscover it. 0.30 is permissive but still rejects rims that are a
+# random mix of all four ring colors (= probably not a ring at all).
+COLOR_DOMINANCE_THR = 0.30
 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -334,6 +333,16 @@ class RingDetector(Node):
         cc_mask = self._neighbourhood_color_consistency(rgb_at_dep_res, depth_m)
         binary = cv2.bitwise_and(binary, cc_mask)
 
+        # ── AND with ring-color mask ─────────────────────────────────────
+        # Only keep pixels that fall within one of the four ring colors
+        # (red, green, blue, black). Anything else -- skin, wood, painted
+        # walls, posters, hanger arms -- gets dropped here. Uses the same
+        # COLOR_RANGES_HSV that the rim color classifier uses, so the two
+        # stages stay consistent: if a pixel passes here, the downstream
+        # rim color check is guaranteed to find a registered color for it.
+        ring_color_mask = self._ring_color_mask(rgb_at_dep_res)
+        binary = cv2.bitwise_and(binary, ring_color_mask)
+
         # ── Cleanup pass: drop "on" pixels with sparse "on" neighbourhood ─
         # Soft alternative to morphological erosion. Erosion would remove a
         # pixel that doesn't have *all* its KxK neighbours on; this drops
@@ -369,46 +378,62 @@ class RingDetector(Node):
                 self._rej_stats['rej_contour_pts'] += 1
                 continue
 
-            # ── Circularity filter ────────────────────────────────────────
-            area      = cv2.contourArea(cnt)
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter < 1e-3:
-                self._rej_stats['rej_circularity'] += 1
-                continue
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            if circularity < MIN_CIRCULARITY:
-                self._rej_stats['rej_circularity'] += 1
-                continue
+            # ── DIAGNOSTIC MODE: all post-fitEllipse filters disabled ─────
+            # We keep MIN_CONTOUR_PTS only because fitEllipse needs >=5
+            # points to run at all. Everything else (circularity, axis,
+            # ratio, size, hole, color) is bypassed. Every contour that
+            # survives fitEllipse becomes a candidate and gets drawn.
+            #
+            # This is for figuring out which rings are reaching
+            # findContours but being filtered later. If all 4 rings show
+            # ellipses on screen with this enabled but NOT with filters on,
+            # the filters are too strict. If a ring STILL doesn't show an
+            # ellipse, the problem is upstream (segmentation mask doesn't
+            # contain that ring's contour).
+            #
+            # To restore filters: uncomment the block below.
 
-            ellipse_dep = cv2.fitEllipse(cnt)
+            # # ── Circularity filter ────────────────────────────────────────
+            # area      = cv2.contourArea(cnt)
+            # perimeter = cv2.arcLength(cnt, True)
+            # if perimeter < 1e-3:
+            #     self._rej_stats['rej_circularity'] += 1
+            #     continue
+            # circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+            # if circularity < MIN_CIRCULARITY:
+            #     self._rej_stats['rej_circularity'] += 1
+            #     continue
+
+            try:
+                ellipse_dep = cv2.fitEllipse(cnt)
+            except cv2.error:
+                continue
             ax1, ax2 = ellipse_dep[1]
             if ax1 <= 0 or ax2 <= 0:
                 self._rej_stats['rej_axis_invalid'] += 1
                 continue
-            major = max(ax1, ax2)
-            minor = min(ax1, ax2)
-            ratio = major / minor
-            if ratio > AXIS_RATIO_MAX:
-                self._rej_stats['rej_ratio'] += 1
-                continue
-            if minor < AXIS_MIN_PX or major > AXIS_MAX_PX:
-                self._rej_stats['rej_size'] += 1
-                continue
 
-            # ── Topology check: real ring should have a child contour ─────
-            # hierarchy shape: (1, N, 4)  → [next, prev, first_child, parent]
-            has_child = (hierarchy[0][idx][2] != -1)
-            if not has_child:
-                # No inner hole contour found.  Still allow if depth hole check
-                # passes strongly (the ring may be too small / close for the
-                # inner edge to form a separate contour), but count the miss.
-                self.get_logger().debug(
-                    f'Contour {idx}: no child contour (topology miss); continuing to depth check')
+            # # ── Axis ratio / size filters (disabled) ──────────────────────
+            # major = max(ax1, ax2)
+            # minor = min(ax1, ax2)
+            # ratio = major / minor
+            # if ratio > AXIS_RATIO_MAX:
+            #     self._rej_stats['rej_ratio'] += 1
+            #     continue
+            # if minor < AXIS_MIN_PX or major > AXIS_MAX_PX:
+            #     self._rej_stats['rej_size'] += 1
+            #     continue
 
-            # ── Fake-ring rejection via depth hole check ──────────────────
-            if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
-                self._rej_stats['rej_hole'] += 1
-                continue
+            # # ── Topology check (disabled) ─────────────────────────────────
+            # has_child = (hierarchy[0][idx][2] != -1)
+            # if not has_child:
+            #     self.get_logger().debug(
+            #         f'Contour {idx}: no child contour (topology miss); continuing to depth check')
+
+            # # ── Fake-ring rejection via depth hole check (disabled) ──────
+            # if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
+            #     self._rej_stats['rej_hole'] += 1
+            #     continue
 
             # Scale ellipse centre & axes to RGB image coordinates
             cx_d, cy_d = ellipse_dep[0]
@@ -431,14 +456,14 @@ class RingDetector(Node):
         stamp = rgb_msg.header.stamp
 
         for ellipse_dep, ellipse_rgb in candidates:
-            # Color classification + gate. _classify_color returns 'unknown'
-            # when no registered color dominates the rim -- this is how we
-            # reject the hanger arm and any other non-ring objects that
-            # otherwise pass the geometric / hole filters.
+            # ── DIAGNOSTIC MODE: color check disabled ─────────────────────
+            # Normally an 'unknown' rim color would reject the candidate
+            # here. With filters off, we accept anyway and just tag it.
+            # Restore behaviour by uncommenting the `continue` below.
             color_name = self._classify_color(rgb, ellipse_rgb)
             if color_name == 'unknown':
                 self._rej_stats['rej_color'] += 1
-                continue   # actual rejection, not just a tag
+                # continue   # would reject in normal mode
 
             # 3-D localisation via back-projection.
             # Use the RING PERIMETER depth (material surface), not the hole
@@ -644,6 +669,33 @@ class RingDetector(Node):
         return (keep.astype(np.uint8)) * 255
 
     @staticmethod
+    def _ring_color_mask(bgr: np.ndarray) -> np.ndarray:
+        """
+        Build a binary mask of pixels that match ANY of the registered ring
+        colors (COLOR_RANGES_HSV: red, green, blue, black).
+
+        Used as a pixel-level filter: anything that isn't one of the four
+        target colors gets dropped at segmentation time, so it never even
+        reaches contour-finding. This is cheap (one inRange per HSV range,
+        OR'd together) and dramatically reduces the search space when the
+        scene contains lots of non-ring colors -- which a classroom always
+        does.
+
+        Note: this is intentionally permissive (a pixel matching ANY ring
+        color survives). The job of identifying *which* color a particular
+        ring is happens later in _classify_color, which looks at the
+        dominant color in the rim annulus.
+        """
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        out = np.zeros((h, w), dtype=np.uint8)
+        for _color, ranges in COLOR_RANGES_HSV.items():
+            for lo, hi in ranges:
+                out |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8),
+                                        np.array(hi, dtype=np.uint8))
+        return out
+
+    @staticmethod
     def _sparse_neighbourhood_cleanup(
         binary: np.ndarray, K: int, min_frac: float
     ) -> np.ndarray:
@@ -677,8 +729,6 @@ class RingDetector(Node):
     # ──────────────────────────────────────────────────────────────────────
 
     def _ellipse_has_real_hole(self, depth_m: np.ndarray, ellipse) -> bool:
-
-        return True
         """
         Returns True only if the ellipse looks like a REAL ring with a physical
         hole, not a printed image on a box surface.
