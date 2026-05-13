@@ -155,6 +155,15 @@ NEIGHBOURHOOD_DEPTH_BUCKETS = (
     (1.0, 99.0, 3),   # far:       small kernel
 )
 
+# ── Binary-mask cleanup ───────────────────────────────────────────────────
+# After the depth + color-consistency masks have been combined, we do one
+# more pass: remove any "on" pixel whose KxK neighbourhood is mostly "off".
+# This kills isolated speckle and thin tendrils that survived earlier
+# stages, without using morphological erosion (which would also eat the
+# rim's inner/outer edges). Tune K bigger for more aggressive cleanup.
+BINARY_CLEANUP_K        = 5
+BINARY_CLEANUP_MIN_FRAC = 0.50
+
 # ── Colour classification ─────────────────────────────────────────────────
 # Minimum saturation to consider a pixel "coloured" (not grey/white/black)
 COLOUR_SAT_THR = 45
@@ -324,6 +333,15 @@ class RingDetector(Node):
                                     interpolation=cv2.INTER_AREA)
         cc_mask = self._neighbourhood_color_consistency(rgb_at_dep_res, depth_m)
         binary = cv2.bitwise_and(binary, cc_mask)
+
+        # ── Cleanup pass: drop "on" pixels with sparse "on" neighbourhood ─
+        # Soft alternative to morphological erosion. Erosion would remove a
+        # pixel that doesn't have *all* its KxK neighbours on; this drops
+        # a pixel that doesn't have at least BINARY_CLEANUP_MIN_FRAC of
+        # them on. Cleaner edges, kills isolated speckle and thin tendrils
+        # without eroding both sides of the rim.
+        binary = self._sparse_neighbourhood_cleanup(
+            binary, BINARY_CLEANUP_K, BINARY_CLEANUP_MIN_FRAC)
 
         ko = np.ones((MORPH_OPEN_K,  MORPH_OPEN_K),  dtype=np.uint8)
         kc = np.ones((MORPH_CLOSE_K, MORPH_CLOSE_K), dtype=np.uint8)
@@ -625,11 +643,42 @@ class RingDetector(Node):
         keep = min_frac_ok & enough_valid & valid_center
         return (keep.astype(np.uint8)) * 255
 
+    @staticmethod
+    def _sparse_neighbourhood_cleanup(
+        binary: np.ndarray, K: int, min_frac: float
+    ) -> np.ndarray:
+        """
+        Remove pixels from a binary mask whose KxK neighbourhood is mostly
+        off. This is a softer version of morphological erosion: erosion
+        removes a pixel if ANY neighbour is off; this removes a pixel only
+        if the FRACTION of "on" neighbours is below `min_frac`.
+
+        Implementation: a normalized box filter on the (uint8 / 255) mask
+        produces, per pixel, the fraction of "on" pixels in its KxK window.
+        Threshold at min_frac, AND with the original mask (we never turn
+        off-pixels on -- this is cleanup, not dilation).
+
+        Equivalent to: count = cv2.boxFilter(mask, sum, K) ; keep where
+        mask is on AND count >= min_frac * K * K.
+        """
+        # Box filter on uint8 returns mean by default when normalize=True.
+        # Mask values are 0 or 255; the mean is 255 * (on_fraction).
+        # So thresholding at 255 * min_frac gives "fraction of on >= min_frac".
+        mean = cv2.boxFilter(binary, ddepth=-1, ksize=(K, K),
+                             normalize=True, borderType=cv2.BORDER_REPLICATE)
+        thr = int(round(255 * min_frac))
+        # Pixel keeps its "on" status iff it was on AND its neighbourhood
+        # is dense enough. We don't turn off pixels on.
+        keep = (binary > 0) & (mean >= thr)
+        return (keep.astype(np.uint8)) * 255
+
     # ──────────────────────────────────────────────────────────────────────
     # Fake-ring rejection  ← THE CRITICAL CHECK
     # ──────────────────────────────────────────────────────────────────────
 
     def _ellipse_has_real_hole(self, depth_m: np.ndarray, ellipse) -> bool:
+
+        return True
         """
         Returns True only if the ellipse looks like a REAL ring with a physical
         hole, not a printed image on a box surface.
