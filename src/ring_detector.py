@@ -1,29 +1,4 @@
-#!/usr/bin/env python3
-
-"""
-Ring detection node for TurtleBot4 with Gemini 355L camera (real world).
-
-Overview
---------
-- Subscribes to /gemini/color/image_raw  (RGB, bgr8)
-- Subscribes to /gemini/depth/image_raw  (uint16, millimetres, aligned to colour)
-- Subscribes to /gemini/depth/camera_info (pinhole intrinsics, received once)
-- Uses ApproximateTimeSynchronizer → single callback per (RGB, depth) pair,
-  eliminating all async race conditions from the original code.
-- Detects rings via ellipse fitting on a depth-binary image.
-- Rejects FAKE rings (printed images on boxes) by checking that the centre of
-  a detected ellipse is SIGNIFICANTLY farther away than the ring perimeter –
-  a real hole-in-the-middle ring has no surface behind it at close range,
-  while a printed image has the box surface at the same depth.
-- Back-projects pixel + depth → 3-D in camera frame via pinhole intrinsics,
-  then transforms to map frame via TF2.
-- Two-stage pending → confirmed filter prevents false positive rings from
-  a single noisy frame from entering the final output.
-- Merges duplicate detections of the same physical ring; resolves colour
-  by majority vote over all confirmed hits.
-- Publishes confirmed rings on /ring_coords.
-- Displays annotated visualisation windows.
-"""
+"""Ring detector node. See README.md for design, topics, and tuning."""
 
 import rclpy
 import rclpy.time
@@ -46,71 +21,41 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros import TransformException
 
+DEPTH_MIN_M        = 0.30
+DEPTH_MAX_M        = 1.50
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Tunable parameters  (one place to change everything)
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ── Depth validity ─────────────────────────────────────────────────────────
-DEPTH_MIN_M        = 0.30   # closer than this → sensor noise [m]
-DEPTH_MAX_M        = 1.50   # rings are within ~1 m; discard everything beyond [m]
-
-# ── Depth-binary range (objects to segment) ───────────────────────────────
 BINARY_DEPTH_MIN_M = 0.25
-BINARY_DEPTH_MAX_M = 1.50   # matches DEPTH_MAX_M
+BINARY_DEPTH_MAX_M = 1.50
 
-# ── Morphological kernel sizes ─────────────────────────────────────────────
-MORPH_OPEN_K  = 1   # keep thin ring structures (1x1 open is effectively no-op)
-MORPH_CLOSE_K = 3   # still close small contour gaps without over-smoothing
+MORPH_OPEN_K  = 1
+MORPH_CLOSE_K = 3
 
-# ── Ellipse geometry filters ──────────────────────────────────────────────
-MIN_CONTOUR_PTS  = 15    # minimum contour points to attempt ellipse fit
-AXIS_RATIO_MAX   = 3.5   # max major/minor ratio (rejects very elongated ellipses)
-AXIS_MIN_PX      = 8     # minor axis must be at least this many pixels
-AXIS_MAX_PX      = 260   # major axis must be at most this many pixels (avoids huge blobs)
-# Minimum circularity: 4π·area / perimeter².  Circle = 1.0, thin arc ≈ 0.
-# Rings appear as roughly circular blobs; scene clutter (table edges, box
-# corners) tends to be elongated/angular with much lower circularity.
+MIN_CONTOUR_PTS  = 15
+AXIS_RATIO_MAX   = 3.5
+AXIS_MIN_PX      = 8
+AXIS_MAX_PX      = 260
+
 MIN_CIRCULARITY  = 0.25
 
-# Max mean normalized distance from contour points to the fitted ellipse.
-# A perfect ellipse fit has 0 residual. Real ring contours sit around
-# 0.05-0.10. Non-ring contours that happen to pass fitEllipse (because
-# fitEllipse fits SOMETHING to any 5+ points) typically score 0.15+.
-# Tighter than circularity at catching "fit is geometrically suspicious"
-# even when the contour's overall shape looks roundish on average.
 MAX_ELLIPSE_RESIDUAL  = 0.15
 
-# ── Ring hole validation ───────────────────────────────────────────────────
-# The inner ellipse used to sample the hole is this fraction of the outer one.
 INNER_SCALE           = 0.45
-# Minimum number of valid depth samples needed on the ring perimeter.
+
 MIN_RING_DEPTH_PTS    = 8
-# Patch half-size for centre-depth sampling [pixels]
+
 CENTRE_PATCH_HALF     = 5
-# Minimum number of valid depth pixels inside the centre patch.
+
 MIN_CENTRE_PATCH_PTS  = 2
-# Real ring: hole depth must exceed ring depth by at least this much [m].
-# Setup: rings hung on arms with no wall directly behind them, so the hole
-# genuinely sees far (other side of the room, ceiling, etc.). 0.03 sits
-# above the camera's ~2-3 cm depth noise floor but well below any actual
-# free-air gap behind the ring. The previous 0.10 was too strict for cases
-# where a person briefly walks ~10 cm behind a ring.
+
 HOLE_DEPTH_MARGIN_M   = 0.03
-# Fraction of hole-region pixels that must be invalid (zero / out-of-range)
-# to accept the "strong hole" path.  Raised from 0.40 → 0.60 to reduce
-# false positives from noisy scene regions that happen to have some bad pixels.
+
 HOLE_INVALID_FRACTION = 0.60
 
-# ── 3-D back-projection: depth sampling ───────────────────────────────────
-# Patch around ellipse centre used to compute the median ring depth for 3-D.
-BACKPROJ_PATCH_HALF  = 8   # 17×17 pixel patch
+BACKPROJ_PATCH_HALF  = 8
 
-# ── Two-stage confirmation ─────────────────────────────────────────────────
-PENDING_MINHITS       = 3    # hits in pending stage before promotion
-PENDING_KEEPTIME_NS   = int(4e9)   # 4 s max age for a pending candidate (was 8 s)
+PENDING_MINHITS       = 3
+PENDING_KEEPTIME_NS   = int(4e9)
 
-# ── Spatial matching thresholds (map frame) [m] ───────────────────────────
 PENDING_XY_THR  = 0.55
 PENDING_Z_THR   = 0.55
 MATCH_XY_THR    = 0.65
@@ -118,87 +63,35 @@ MATCH_Z_THR     = 0.65
 MERGE_XY_THR    = 0.45
 MERGE_Z_THR     = 0.45
 
-# ── Publishing ─────────────────────────────────────────────────────────────
-PUBLISH_MIN_HITS = 6    # confirmed ring must have this many hits to be published
+PUBLISH_MIN_HITS = 6
 
-# ── Time synchronisation ───────────────────────────────────────────────────
 SYNC_QUEUE  = 10
 SYNC_SLOP_S = 0.08
 
-# ── Neighbourhood color + depth consistency filter ────────────────────────
-# For each pixel we look at its KxK window and count how many neighbours
-# agree with the center in BOTH color (Lab dE) and depth. A pixel survives
-# iff at least NEIGHBOURHOOD_MIN_FRAC of its VALID neighbours agree.
-#
-# Two refinements vs. a naive fixed-kernel color filter:
-#
-# 1. Kernel size scales inversely with depth. A ring's rim has a roughly
-#    fixed physical thickness (~1 cm), so at 0.3 m it covers ~12 px while
-#    at 1.5 m it covers ~2-3 px. A fixed 5x5 window straddles the rim AND
-#    background at far distances and over-rejects. We use three discrete
-#    sizes (3, 5, 9) selected per pixel by depth bucket.
-#
-# 2. Neighbours must agree on depth too, not just color. Without this,
-#    pixels at the ring/wall boundary where the wall happens to be a
-#    similar color (or in poor lighting) survive. Adding the depth
-#    agreement means each pixel's neighbourhood is effectively pixels
-#    on the same physical surface.
-#
-# CIE76 dE: ~2.3 just noticeable, ~10 clearly different, 15 generously
-# permissive. Tune NEIGHBOURHOOD_DE_THR down for stricter color matching.
 NEIGHBOURHOOD_DE_THR     = 15.0
 NEIGHBOURHOOD_MIN_FRAC   = 0.60
-# Depth agreement: relative threshold because sensor noise scales with Z.
-# At 1 m, 3% = 3 cm, comparable to a typical structured-light camera's
-# σ at that range. The ring rim is ~2 cm thick, so this captures the rim
-# while still cutting the wall a few cm behind it.
+
 NEIGHBOURHOOD_DZ_REL_THR = 0.03
-# Need at least this many valid neighbours before we trust the agreement
-# ratio -- prevents a single agreeing neighbour from passing the 60% test.
+
 NEIGHBOURHOOD_MIN_VALID  = 6
-# Depth buckets -> kernel size. Boundaries in meters, [near, far) lookups.
-# Tune by looking at the rim thickness in the binary debug image and
-# making sure the kernel size is smaller than the rim at every distance
-# you care about.
+
 NEIGHBOURHOOD_DEPTH_BUCKETS = (
-    (0.0, 0.5, 9),    # very near: large kernel
-    (0.5, 1.0, 5),    # mid:       medium kernel
-    (1.0, 99.0, 3),   # far:       small kernel
+    (0.0, 0.5, 9),
+    (0.5, 1.0, 5),
+    (1.0, 99.0, 3),
 )
 
-# ── Binary-mask cleanup ───────────────────────────────────────────────────
-# After the depth + color-consistency masks have been combined, we do one
-# more pass: remove any "on" pixel whose KxK neighbourhood is mostly "off".
-# This kills isolated speckle and thin tendrils that survived earlier
-# stages, without using morphological erosion (which would also eat the
-# rim's inner/outer edges). Tune K bigger for more aggressive cleanup.
 BINARY_CLEANUP_K        = 5
 BINARY_CLEANUP_MIN_FRAC = 0.50
 
-# ── Hollow-out filter (experimental) ──────────────────────────────────────
-# After cleanup, remove any "on" pixel whose KxK neighbourhood is mostly
-# also "on". Effect: solid filled blobs become thin outlines tracing their
-# boundaries. A solid disc becomes a ring-shaped loop; a ring rim that's
-# thicker than HOLLOW_K-2 pixels gets thinned to two parallel curves
-# (inner and outer rim edges).
-#
-# Caveat: this also thins real ring rims. If the rim ends up too thin
-# fitEllipse may produce a worse fit. Disable if real detection rates drop.
 HOLLOW_ENABLE   = True
 HOLLOW_K        = 5
-HOLLOW_MAX_FRAC = 0.85   # remove if MORE than this fraction of neighbours are on
+HOLLOW_MAX_FRAC = 0.85
 
-# ── Colour classification ─────────────────────────────────────────────────
-# Minimum saturation to consider a pixel "coloured" (not grey/white/black)
 COLOUR_SAT_THR = 45
-# Minimum value (brightness) – discard very dark pixels which are unreliable
+
 COLOUR_VAL_THR = 30
 
-# Per-color HSV ranges used to test whether the ring's rim is dominantly
-# that color. Each entry: list of (lo, hi) HSV tuples. Red wraps the hue
-# circle so it needs two ranges. Black ignores hue, requires low V and
-# also-low S (saturated dark colors are not black). Tune on the real robot
-# by looking at the binary masks per color in rqt_image_view.
 COLOR_RANGES_HSV = {
     'red': [
         ((0,   110, 70),  (10,  255, 255)),
@@ -209,26 +102,16 @@ COLOR_RANGES_HSV = {
     'black': [((0,   0,   0),   (179, 80,  60))],
 }
 
-# A rim is classified as color X if at least this fraction of rim pixels
-# fall within X's HSV ranges. Was 0.60 when this was the primary filter;
-# now that _ring_color_mask pre-filters pixels at segmentation time, the
-# rim check only needs to confirm a consistent color identity, not
-# rediscover it. 0.30 is permissive but still rejects rims that are a
-# random mix of all four ring colors (= probably not a ring at all).
 COLOR_DOMINANCE_THR = 0.30
-
-# ═══════════════════════════════════════════════════════════════════════════
 
 class RingDetector(Node):
 
     def __init__(self):
         super().__init__('ring_detector')
 
-        # ── Camera intrinsics (filled once from camera_info) ──────────────
         self.fx = self.fy = self.cx_cam = self.cy_cam = None
         self.camera_frame = None
 
-        # ── ROS infrastructure ────────────────────────────────────────────
         self.bridge      = CvBridge()
         self.tf_buffer   = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -239,7 +122,6 @@ class RingDetector(Node):
             CameraInfo, '/gemini/depth/camera_info',
             self._camera_info_cb, sensor_qos)
 
-        # Synchronised RGB + depth
         self._rgb_sub   = message_filters.Subscriber(
             self, Image, '/gemini/color/image_raw',  qos_profile=sensor_qos)
         self._depth_sub = message_filters.Subscriber(
@@ -249,14 +131,10 @@ class RingDetector(Node):
             queue_size=SYNC_QUEUE, slop=SYNC_SLOP_S)
         self._sync.registerCallback(self._rgbd_cb)
 
-        # ── Tracking state ────────────────────────────────────────────────
-        # pending:   [(Point[map], hit_count, last_seen, color_votes:dict), ...]
-        # confirmed: [(ring_id, Point[map], hit_count, last_seen, color_votes:dict), ...]
         self.pending   = []
         self.confirmed = []
         self.next_id   = 1
 
-        # ── Rejection diagnostics (aggregated, logged once per second) ───
         self._rej_stats = {
             'frames': 0,
             'contours': 0,
@@ -276,20 +154,14 @@ class RingDetector(Node):
         }
         self._last_rej_log_ns = self.get_clock().now().nanoseconds
 
-        # ── Publisher ─────────────────────────────────────────────────────
         self.coord_pub = self.create_publisher(RingCoords, '/ring_coords', 10)
         self.create_timer(1.0 / 5.0, self._publish_cb)
 
-        # ── Visualisation windows ─────────────────────────────────────────
         cv2.namedWindow('Ring detector – RGB',    cv2.WINDOW_NORMAL)
         cv2.namedWindow('Ring detector – Binary', cv2.WINDOW_NORMAL)
         cv2.namedWindow('Ring detector – Depth',  cv2.WINDOW_NORMAL)
 
         self.get_logger().info('RingDetector initialised – waiting for camera_info…')
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Camera info
-    # ──────────────────────────────────────────────────────────────────────
 
     def _camera_info_cb(self, msg: CameraInfo):
         if self.fx is not None:
@@ -303,10 +175,6 @@ class RingDetector(Node):
             f'cx={self.cx_cam:.1f} cy={self.cy_cam:.1f}  frame={self.camera_frame}')
         self.destroy_subscription(self.info_sub)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Main synchronised callback
-    # ──────────────────────────────────────────────────────────────────────
-
     def _rgbd_cb(self, rgb_msg: Image, depth_msg: Image):
         if self.fx is None:
             self.get_logger().warn(
@@ -315,7 +183,6 @@ class RingDetector(Node):
 
         self._rej_stats['frames'] += 1
 
-        # ── Decode ────────────────────────────────────────────────────────
         try:
             rgb   = self.bridge.imgmsg_to_cv2(rgb_msg,   'bgr8')
             depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
@@ -323,57 +190,30 @@ class RingDetector(Node):
             self.get_logger().error(f'CvBridge: {e}')
             return
 
-        # Gemini 355L depth is uint16 millimetres.
-        # Median blur on the raw uint16 removes salt-and-pepper noise while
-        # preserving edges better than a Gaussian would.
         depth_raw = cv2.medianBlur(depth_raw, 5)
 
         depth_m = depth_raw.astype(np.float32) / 1000.0
         depth_m[~np.isfinite(depth_m)] = 0.0
 
-        # Hard clamp: anything beyond DEPTH_MAX_M is irrelevant (rings are
-        # within ~1 m) and only adds noise to contour finding.
         depth_m[depth_m > DEPTH_MAX_M] = 0.0
 
         h_rgb, w_rgb = rgb.shape[:2]
         h_dep, w_dep = depth_m.shape[:2]
 
-        # Rings are hung on a wall above the floor — blank out the lower half
-        # of the depth image to eliminate floor/base clutter entirely.
         depth_m[h_dep // 2:, :] = 0.0
 
-        # ── Build depth-binary segmentation mask ─────────────────────────
         valid = (depth_m > DEPTH_MIN_M) & (depth_m < DEPTH_MAX_M)
         binary = np.zeros(depth_m.shape, dtype=np.uint8)
         binary[valid & (depth_m > BINARY_DEPTH_MIN_M) & (depth_m < BINARY_DEPTH_MAX_M)] = 255
 
-        # ── AND with neighbourhood color+depth consistency mask ──────────
-        # A pixel survives only if its neighbourhood mostly agrees on BOTH
-        # color and depth. Kernel size scales inversely with depth so the
-        # window stays smaller than the ring rim at every distance.
-        # Built at depth resolution so it lines up with the depth-binary
-        # mask above. See NEIGHBOURHOOD_* constants for tuning.
         rgb_at_dep_res = cv2.resize(rgb, (w_dep, h_dep),
                                     interpolation=cv2.INTER_AREA)
         cc_mask = self._neighbourhood_color_consistency(rgb_at_dep_res, depth_m)
         binary = cv2.bitwise_and(binary, cc_mask)
 
-        # ── AND with ring-color mask ─────────────────────────────────────
-        # Only keep pixels that fall within one of the four ring colors
-        # (red, green, blue, black). Anything else -- skin, wood, painted
-        # walls, posters, hanger arms -- gets dropped here. Uses the same
-        # COLOR_RANGES_HSV that the rim color classifier uses, so the two
-        # stages stay consistent: if a pixel passes here, the downstream
-        # rim color check is guaranteed to find a registered color for it.
         ring_color_mask = self._ring_color_mask(rgb_at_dep_res)
         binary = cv2.bitwise_and(binary, ring_color_mask)
 
-        # ── Cleanup pass: drop "on" pixels with sparse "on" neighbourhood ─
-        # Soft alternative to morphological erosion. Erosion would remove a
-        # pixel that doesn't have *all* its KxK neighbours on; this drops
-        # a pixel that doesn't have at least BINARY_CLEANUP_MIN_FRAC of
-        # them on. Cleaner edges, kills isolated speckle and thin tendrils
-        # without eroding both sides of the rim.
         binary = self._sparse_neighbourhood_cleanup(
             binary, BINARY_CLEANUP_K, BINARY_CLEANUP_MIN_FRAC)
 
@@ -382,25 +222,13 @@ class RingDetector(Node):
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  ko)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kc)
 
-        # ── Hollow-out pass: remove interior pixels of solid blobs ───────
-        # Inverse of the cleanup pass: a pixel survives only if NOT too
-        # surrounded by other "on" pixels. Effect: thick filled regions
-        # become outlines. Useful for shrinking false-positive solid blobs
-        # into ring-like outlines that subsequent filters can reject more
-        # easily. Comes after morphology so we hollow out the cleaned mask.
         if HOLLOW_ENABLE:
             binary = self._hollow_out(binary, HOLLOW_K, HOLLOW_MAX_FRAC)
 
-        # ── Find contours and fit ellipses ────────────────────────────────
-        # RETR_TREE: retrieve full hierarchy so we can check that a candidate
-        # contour actually contains a child (the hole inside the ring).  A real
-        # ring in a binary depth image has its outer edge as a parent contour
-        # with at least one child contour representing the inner hole edge.
-        # Flat printed rings and random blobs typically have NO child contours.
         contours, hierarchy = cv2.findContours(
             binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        candidates = []   # (ellipse_in_depth_coords, ellipse_in_rgb_coords)
+        candidates = []
         raw_ellipses_rgb = []
 
         scale_x = w_rgb / w_dep
@@ -412,32 +240,6 @@ class RingDetector(Node):
                 self._rej_stats['rej_contour_pts'] += 1
                 continue
 
-            # ── DIAGNOSTIC MODE: all post-fitEllipse filters disabled ─────
-            # We keep MIN_CONTOUR_PTS only because fitEllipse needs >=5
-            # points to run at all. Everything else (circularity, axis,
-            # ratio, size, hole, color) is bypassed. Every contour that
-            # survives fitEllipse becomes a candidate and gets drawn.
-            #
-            # This is for figuring out which rings are reaching
-            # findContours but being filtered later. If all 4 rings show
-            # ellipses on screen with this enabled but NOT with filters on,
-            # the filters are too strict. If a ring STILL doesn't show an
-            # ellipse, the problem is upstream (segmentation mask doesn't
-            # contain that ring's contour).
-            #
-            # To restore filters: uncomment the block below.
-
-            # # ── Circularity filter ────────────────────────────────────────
-            # area      = cv2.contourArea(cnt)
-            # perimeter = cv2.arcLength(cnt, True)
-            # if perimeter < 1e-3:
-            #     self._rej_stats['rej_circularity'] += 1
-            #     continue
-            # circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            # if circularity < MIN_CIRCULARITY:
-            #     self._rej_stats['rej_circularity'] += 1
-            #     continue
-
             try:
                 ellipse_dep = cv2.fitEllipse(cnt)
             except cv2.error:
@@ -447,45 +249,15 @@ class RingDetector(Node):
                 self._rej_stats['rej_axis_invalid'] += 1
                 continue
 
-            # ── Ellipse fit residual ─────────────────────────────────────
-            # How well does the contour actually match its fitted ellipse?
-            # fitEllipse always succeeds with SOME ellipse for 5+ points;
-            # this is what catches "contour passed but the fit is geometric
-            # nonsense." Mean normalized distance from contour points to
-            # the unit circle in the ellipse's local frame. Real rings
-            # score ~0.05, table edges and L-shapes score 0.2+.
             residual = self._ellipse_fit_residual(cnt, ellipse_dep)
             if residual > MAX_ELLIPSE_RESIDUAL:
                 self._rej_stats['rej_residual'] += 1
                 continue
 
-            # # ── Axis ratio / size filters (disabled) ──────────────────────
-            # major = max(ax1, ax2)
-            # minor = min(ax1, ax2)
-            # ratio = major / minor
-            # if ratio > AXIS_RATIO_MAX:
-            #     self._rej_stats['rej_ratio'] += 1
-            #     continue
-            # if minor < AXIS_MIN_PX or major > AXIS_MAX_PX:
-            #     self._rej_stats['rej_size'] += 1
-            #     continue
-
-            # # ── Topology check (disabled) ─────────────────────────────────
-            # has_child = (hierarchy[0][idx][2] != -1)
-            # if not has_child:
-            #     self.get_logger().debug(
-            #         f'Contour {idx}: no child contour (topology miss); continuing to depth check')
-
-            # ── Fake-ring rejection via depth hole check ─────────────────
-            # Rejects flat printed discs and anything where the rim region
-            # has no visible depth jump on the interior. Margin is tight
-            # (3 cm) -- this works because the rings are hung in space,
-            # not against a wall, so the hole genuinely sees far.
             if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
                 self._rej_stats['rej_hole'] += 1
                 continue
 
-            # Scale ellipse centre & axes to RGB image coordinates
             cx_d, cy_d = ellipse_dep[0]
             ax1_d, ax2_d = ellipse_dep[1]
             ellipse_rgb = (
@@ -496,9 +268,8 @@ class RingDetector(Node):
 
             candidates.append((ellipse_dep, ellipse_rgb))
             self._rej_stats['candidates'] += 1
-            raw_ellipses_rgb.append(ellipse_dep)   # for yellow candidate overlay
+            raw_ellipses_rgb.append(ellipse_dep)
 
-        # ── Visualisation ─────────────────────────────────────────────────
         vis   = rgb.copy()
         depth_vis = self._depth_to_gray(depth_m)
 
@@ -506,18 +277,11 @@ class RingDetector(Node):
         stamp = rgb_msg.header.stamp
 
         for ellipse_dep, ellipse_rgb in candidates:
-            # ── DIAGNOSTIC MODE: color check disabled ─────────────────────
-            # Normally an 'unknown' rim color would reject the candidate
-            # here. With filters off, we accept anyway and just tag it.
-            # Restore behaviour by uncommenting the `continue` below.
+
             color_name = self._classify_color(rgb, ellipse_rgb)
             if color_name == 'unknown':
                 self._rej_stats['rej_color'] += 1
-                # continue   # would reject in normal mode
 
-            # 3-D localisation via back-projection.
-            # Use the RING PERIMETER depth (material surface), not the hole
-            # centre depth (which is air/background and will give wrong 3-D).
             cx_d = int(round(ellipse_dep[0][0]))
             cy_d = int(round(ellipse_dep[0][1]))
 
@@ -530,9 +294,7 @@ class RingDetector(Node):
             if len(valid_pd) >= MIN_RING_DEPTH_PTS:
                 depth_val = float(np.median(valid_pd))
             else:
-                # Fallback: small patch around ellipse centre (may be the hole,
-                # but at least gives a rough estimate so we don't throw away
-                # valid rings that are partially occluded).
+
                 depth_val = self._sample_depth_patch(depth_m, cx_d, cy_d)
                 if depth_val is None:
                     self._rej_stats['rej_depth'] += 1
@@ -549,11 +311,9 @@ class RingDetector(Node):
                 self._rej_stats['rej_nonfinite'] += 1
                 continue
 
-            # Update tracking
             self._update_tracking(mx, my, mz, color_name, now)
             self._rej_stats['accepted'] += 1
 
-            # Draw on visualisation
             try:
                 cv2.ellipse(vis, ellipse_rgb, (0, 255, 0), 2)
             except Exception:
@@ -565,12 +325,10 @@ class RingDetector(Node):
                         (cx_v + 8, cy_v),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
-        # ── Housekeeping ──────────────────────────────────────────────────
         self._remove_stale_pending(now)
         self._merge_confirmed()
         self._maybe_log_rejection_summary(now)
 
-        # HUD
         n_pub = sum(1 for _, _, c, _, _ in self.confirmed if c >= PUBLISH_MIN_HITS)
         cv2.putText(vis,
                     f'Confirmed rings: {n_pub}  |  Pending: {len(self.pending)}',
@@ -588,47 +346,16 @@ class RingDetector(Node):
         if key == 27:
             rclpy.shutdown()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Neighbourhood color-consistency filter
-    # ──────────────────────────────────────────────────────────────────────
-
     def _neighbourhood_color_consistency(
         self, bgr: np.ndarray, depth_m: np.ndarray
     ) -> np.ndarray:
-        """
-        Build a binary mask of pixels whose KxK neighbourhood mostly agrees
-        with them on BOTH color (Lab dE) and depth.
-
-        Two refinements that make this non-trivial:
-
-        1. Kernel size varies per pixel based on the pixel's depth. Far
-           rings have thin rims in pixel space, so a large window leaks
-           background pixels. We run the filter three times with K in
-           {3, 5, 9} and select per-pixel results by depth bucket
-           (NEIGHBOURHOOD_DEPTH_BUCKETS). Three full-image passes is still
-           cheap; per-pixel kernel size with a Python loop would be much
-           slower.
-
-        2. A neighbour counts as "agreeing" iff color is close AND depth
-           is close AND the neighbour has valid depth. The denominator is
-           the count of neighbours with valid depth -- not K*K. This
-           handles depth holes near object edges without penalizing them.
-
-        Returns a uint8 mask, 0 or 255.
-        """
         h, w = bgr.shape[:2]
-        # Pre-compute the per-kernel-size results, then select per pixel.
-        # We index into a stack of result masks using depth bucket index.
+
         kernel_sizes = sorted(set(K for _, _, K in NEIGHBOURHOOD_DEPTH_BUCKETS))
         results: dict[int, np.ndarray] = {}
         for K in kernel_sizes:
             results[K] = self._neighbourhood_pass(bgr, depth_m, K)
 
-        # Build a per-pixel kernel-size selector from depth buckets.
-        # For pixels with invalid depth (0 / NaN / out of range) we keep
-        # the smallest kernel result; they'll fail the depth-binary check
-        # anyway so it doesn't matter much, but using the small kernel is
-        # the cheapest defensible default.
         out = np.zeros((h, w), dtype=np.uint8)
         for lo, hi, K in NEIGHBOURHOOD_DEPTH_BUCKETS:
             bucket = (depth_m >= lo) & (depth_m < hi)
@@ -639,27 +366,13 @@ class RingDetector(Node):
     def _neighbourhood_pass(
         bgr: np.ndarray, depth_m: np.ndarray, K: int
     ) -> np.ndarray:
-        """
-        Single pass of the neighbourhood color+depth consistency filter
-        at a fixed kernel size K.
-
-        Vectorized: K*K shifts of (Lab, depth, validity), each producing
-        a per-pixel agreement+validity counter. No Python-level per-pixel
-        loops.
-        """
         thr_color2 = NEIGHBOURHOOD_DE_THR * NEIGHBOURHOOD_DE_THR
 
-        # cv2.COLOR_BGR2LAB returns L in [0, 255] (true L*[0,100] scaled).
-        # We use int16 so signed subtraction works without overflow.
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int16)
         h, w = lab.shape[:2]
 
-        # Validity mask: pixel has a usable depth reading.
         valid = (depth_m > 0.0) & np.isfinite(depth_m)
 
-        # Pad everything by K//2 so we can shift without losing borders.
-        # BORDER_REPLICATE for color/depth (avoids fake zeros at edges
-        # that would skew the agreement count).
         pad = K // 2
         lab_pad   = cv2.copyMakeBorder(lab, pad, pad, pad, pad,
                                        cv2.BORDER_REPLICATE)
@@ -677,33 +390,20 @@ class RingDetector(Node):
                 depth_shift = depth_pad[dy:dy + h, dx:dx + w]
                 valid_shift = valid_pad[dy:dy + h, dx:dx + w].astype(bool)
 
-                # Color closeness.
                 diff_lab = lab_shift.astype(np.int32) - lab.astype(np.int32)
                 d2_color = (diff_lab[..., 0] ** 2 +
                             diff_lab[..., 1] ** 2 +
                             diff_lab[..., 2] ** 2)
                 color_close = d2_color < thr_color2
 
-                # Depth closeness: relative to the center pixel's depth.
-                # Threshold is NEIGHBOURHOOD_DZ_REL_THR * depth_center, so
-                # close pixels have a tight threshold and far pixels have
-                # a looser one -- matches the camera's per-distance noise.
-                # |z_neighbour - z_center| < tau * z_center
-                # Avoid div-by-zero on invalid centers by using absolute diff
-                # against a threshold computed from the depth itself.
                 dz = np.abs(depth_shift - depth_m)
                 depth_thr = NEIGHBOURHOOD_DZ_REL_THR * depth_m
                 depth_close = dz < depth_thr
 
-                # Both color and depth must agree; neighbour itself must
-                # have valid depth (otherwise dz comparison is meaningless).
                 both = valid_shift & color_close & depth_close
                 agree_count += both
                 valid_count += valid_shift
 
-        # Pixel survives iff (valid neighbours >= MIN_VALID) AND
-        # (agreement fraction >= MIN_FRAC). Without the MIN_VALID gate,
-        # a pixel with 1 valid neighbour that agrees would pass at 100%.
         min_frac_ok = (
             (agree_count.astype(np.float32) /
              np.maximum(valid_count, 1).astype(np.float32))
@@ -711,8 +411,6 @@ class RingDetector(Node):
         )
         enough_valid = valid_count >= NEIGHBOURHOOD_MIN_VALID
 
-        # Also require the center pixel itself to have valid depth -- a
-        # pixel with no depth can't be on a ring.
         valid_center = (depth_m > 0.0) & np.isfinite(depth_m)
 
         keep = min_frac_ok & enough_valid & valid_center
@@ -720,22 +418,6 @@ class RingDetector(Node):
 
     @staticmethod
     def _ring_color_mask(bgr: np.ndarray) -> np.ndarray:
-        """
-        Build a binary mask of pixels that match ANY of the registered ring
-        colors (COLOR_RANGES_HSV: red, green, blue, black).
-
-        Used as a pixel-level filter: anything that isn't one of the four
-        target colors gets dropped at segmentation time, so it never even
-        reaches contour-finding. This is cheap (one inRange per HSV range,
-        OR'd together) and dramatically reduces the search space when the
-        scene contains lots of non-ring colors -- which a classroom always
-        does.
-
-        Note: this is intentionally permissive (a pixel matching ANY ring
-        color survives). The job of identifying *which* color a particular
-        ring is happens later in _classify_color, which looks at the
-        dominant color in the rim annulus.
-        """
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
         out = np.zeros((h, w), dtype=np.uint8)
@@ -749,140 +431,51 @@ class RingDetector(Node):
     def _sparse_neighbourhood_cleanup(
         binary: np.ndarray, K: int, min_frac: float
     ) -> np.ndarray:
-        """
-        Remove pixels from a binary mask whose KxK neighbourhood is mostly
-        off. This is a softer version of morphological erosion: erosion
-        removes a pixel if ANY neighbour is off; this removes a pixel only
-        if the FRACTION of "on" neighbours is below `min_frac`.
 
-        Implementation: a normalized box filter on the (uint8 / 255) mask
-        produces, per pixel, the fraction of "on" pixels in its KxK window.
-        Threshold at min_frac, AND with the original mask (we never turn
-        off-pixels on -- this is cleanup, not dilation).
-
-        Equivalent to: count = cv2.boxFilter(mask, sum, K) ; keep where
-        mask is on AND count >= min_frac * K * K.
-        """
-        # Box filter on uint8 returns mean by default when normalize=True.
-        # Mask values are 0 or 255; the mean is 255 * (on_fraction).
-        # So thresholding at 255 * min_frac gives "fraction of on >= min_frac".
         mean = cv2.boxFilter(binary, ddepth=-1, ksize=(K, K),
                              normalize=True, borderType=cv2.BORDER_REPLICATE)
         thr = int(round(255 * min_frac))
-        # Pixel keeps its "on" status iff it was on AND its neighbourhood
-        # is dense enough. We don't turn off pixels on.
+
         keep = (binary > 0) & (mean >= thr)
         return (keep.astype(np.uint8)) * 255
 
     @staticmethod
     def _hollow_out(binary: np.ndarray, K: int, max_frac: float) -> np.ndarray:
-        """
-        Inverse of _sparse_neighbourhood_cleanup. Remove pixels whose KxK
-        neighbourhood is too densely "on" -- i.e., interior pixels of
-        solid blobs. Effect: filled regions become outlines tracing their
-        original boundaries.
-
-        A pixel at the center of a thick blob has nearly all KxK neighbours
-        on (fraction ~= 1.0) and gets removed. A pixel at the boundary of
-        the same blob has about half its window inside and half outside,
-        fraction ~= 0.5, survives if max_frac > 0.5.
-
-        Tuning: max_frac near 1.0 removes only the deepest interior of
-        very thick blobs. max_frac near 0.5 keeps only thin edges.
-
-        Implementation mirrors _sparse_neighbourhood_cleanup: a box filter
-        gives the per-pixel on-fraction; we keep pixels that are on AND
-        have fraction strictly less than max_frac.
-        """
         mean = cv2.boxFilter(binary, ddepth=-1, ksize=(K, K),
                              normalize=True, borderType=cv2.BORDER_REPLICATE)
         thr = int(round(255 * max_frac))
         keep = (binary > 0) & (mean < thr)
         return (keep.astype(np.uint8)) * 255
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Ellipse fit residual: does the contour ACTUALLY look like the fitted ellipse?
-    # ──────────────────────────────────────────────────────────────────────
-
     @staticmethod
     def _ellipse_fit_residual(contour: np.ndarray, ellipse) -> float:
-        """
-        Mean normalized distance from a contour's points to its fitted ellipse.
-
-        Why this is needed even when fitEllipse succeeds: fitEllipse fits
-        SOMETHING to any 5+ points. An L-shaped contour, a partial arc, a
-        wavy edge -- they all get an ellipse. The returned ellipse just
-        won't match the input well. Circularity (4πA/P²) summarizes shape
-        but is a single global number; a contour that is 3/4 circular and
-        1/4 straight can pass it. The point-to-ellipse residual catches
-        local misfit.
-
-        How: transform the contour points into the ellipse's local frame
-        (translate so center is origin, rotate so axes align with x/y,
-        scale x by 1/a and y by 1/b). In that frame the ellipse becomes
-        the unit circle, and the residual is `||p|| - 1` for each point.
-        This is O(N) vectorized, no root-finding.
-
-        Returns the mean absolute normalized residual. Real ring contours:
-        ~0.03-0.08. Non-ring contours: 0.15+. Threshold around 0.12-0.15.
-        """
         (cx, cy), (axis_a, axis_b), angle_deg = ellipse
-        # OpenCV fitEllipse returns axes as full diameters; convert to
-        # semi-axes for the unit-circle transform.
+
         a = axis_a / 2.0
         b = axis_b / 2.0
         if a < 1e-3 or b < 1e-3:
             return float('inf')
 
-        # Contour comes from findContours as (N, 1, 2) int32. Flatten.
         pts = contour.reshape(-1, 2).astype(np.float64)
 
-        # Translate so ellipse center is at origin.
         pts[:, 0] -= cx
         pts[:, 1] -= cy
 
-        # OpenCV's fitEllipse returns angle in degrees, measured from
-        # +x axis to the FIRST axis (axis_a). Rotate the points by -angle
-        # so axis_a aligns with +x and axis_b with +y.
         theta = -np.deg2rad(angle_deg)
         cos_t, sin_t = np.cos(theta), np.sin(theta)
         rot = np.array([[cos_t, -sin_t],
                         [sin_t,  cos_t]], dtype=np.float64)
         pts = pts @ rot.T
 
-        # Scale so the ellipse becomes the unit circle.
         pts[:, 0] /= a
         pts[:, 1] /= b
 
-        # In this frame, distance-from-ellipse is |sqrt(x² + y²) - 1|.
         dists = np.sqrt(pts[:, 0] ** 2 + pts[:, 1] ** 2)
         return float(np.mean(np.abs(dists - 1.0)))
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Fake-ring rejection  ← THE CRITICAL CHECK
-    # ──────────────────────────────────────────────────────────────────────
-
     def _ellipse_has_real_hole(self, depth_m: np.ndarray, ellipse) -> bool:
-        """
-        Returns True only if the ellipse looks like a REAL ring with a physical
-        hole, not a printed image on a box surface.
-
-        Strategy
-        --------
-        1. Sample depth values on the perimeter of the outer ellipse → ring_depth.
-        2. Sample a patch of depth values inside a scaled-down inner ellipse
-           (the hole region) → hole_depths.
-        3. Accept as real hole when:
-           a) There are enough valid ring-perimeter samples.
-           b) EITHER: hole has mostly invalid/infinite depth (robot sees air/far
-              wall through the hole) → strong signal of a real hole.
-              OR: median hole depth > ring depth + HOLE_DEPTH_MARGIN_M (hole
-              region is farther away → real hole looking at the far background).
-           c) Reject if hole depth ≈ ring depth (flat printed surface).
-        """
         h, w = depth_m.shape[:2]
 
-        # 1. Ring perimeter depth
         perim = self._perimeter_depths(depth_m, ellipse)
         valid_perim = perim[
             np.isfinite(perim) &
@@ -894,13 +487,12 @@ class RingDetector(Node):
             return False
         ring_depth = float(np.median(valid_perim))
 
-        # 2. Inner (hole) region sampling
         inner_ellipse = (
             ellipse[0],
             (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
             ellipse[2]
         )
-        # Draw the inner ellipse mask
+
         mask_inner = np.zeros((h, w), dtype=np.uint8)
         try:
             cv2.ellipse(mask_inner, inner_ellipse, 255, thickness=-1)
@@ -915,8 +507,6 @@ class RingDetector(Node):
 
         hole_raw = depth_m[ys, xs]
 
-        # Pixels with zero depth (sensor returns 0 for no-return = air/glass)
-        # and finite-but-out-of-range are both "hole evidence"
         n_total   = len(hole_raw)
         n_invalid = int(np.sum(
             (hole_raw == 0) |
@@ -926,20 +516,16 @@ class RingDetector(Node):
 
         invalid_fraction = n_invalid / n_total if n_total > 0 else 1.0
 
-        # Strong hole signal: most pixels in the hole region have no depth return
-        # (looking through the air at a far wall, or outside the sensor range)
         if invalid_fraction >= HOLE_INVALID_FRACTION:
             return True
 
-        # Moderate signal: hole depth is measurably farther than ring surface
         valid_hole = hole_raw[
             np.isfinite(hole_raw) &
             (hole_raw > DEPTH_MIN_M) &
             (hole_raw < DEPTH_MAX_M)]
 
         if len(valid_hole) < MIN_CENTRE_PATCH_PTS:
-            # Not enough valid readings in hole → treat as invalid (can't tell)
-            # but since invalid_fraction was < 0.55 there were readings → reject
+
             self.get_logger().debug(
                 f'_ellipse_has_real_hole: insufficient hole depth samples ({len(valid_hole)}), invalid_fraction={invalid_fraction:.2f}')
             return False
@@ -951,13 +537,8 @@ class RingDetector(Node):
                 f'_ellipse_has_real_hole: rejected as fake-like (hole_depth={hole_depth:.2f}, ring_depth={ring_depth:.2f}, margin={HOLE_DEPTH_MARGIN_M:.2f})')
         return is_real
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Ellipse helpers
-    # ──────────────────────────────────────────────────────────────────────
-
     def _perimeter_depths(self, depth_m: np.ndarray, ellipse,
                           delta_deg: int = 8) -> np.ndarray:
-        """Sample depth values around the outer ellipse perimeter."""
         h, w = depth_m.shape[:2]
         cx  = int(round(ellipse[0][0]))
         cy  = int(round(ellipse[0][1]))
@@ -974,17 +555,6 @@ class RingDetector(Node):
 
     def _sample_depth_patch(self, depth_m: np.ndarray,
                             cx: int, cy: int) -> float | None:
-        """
-        Return median valid depth from a small patch around (cx, cy).
-        Used to get a robust depth estimate at the ring centre for 3-D
-        back-projection (we use the ring's own depth, not the hole depth).
-        Here we actually want the ring material depth, so we sample a ring-
-        band patch rather than the dead centre – use the perimeter average
-        instead (called as fallback in the main loop).
-        For the primary estimate we sample a patch at the ellipse centre
-        displaced slightly toward the ring material, but for simplicity we
-        just take a small patch and pick valid, near values (ring surface).
-        """
         h, w = depth_m.shape[:2]
         r = BACKPROJ_PATCH_HALF
         y0, y1 = max(0, cy - r), min(h, cy + r + 1)
@@ -998,38 +568,9 @@ class RingDetector(Node):
             return None
         return float(np.median(valid))
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Colour classification
-    # ──────────────────────────────────────────────────────────────────────
-
     def _classify_color(self, bgr: np.ndarray, ellipse) -> str:
-        """
-        Classify the ring's color, OR return 'unknown' if no color clearly
-        dominates the rim. 'unknown' is treated as a rejection upstream --
-        rings of unrecognized colors and non-ring objects (e.g. the hanger
-        arm) both end up here.
-
-        Approach: build the rim-annulus mask (outer ellipse minus inner
-        ellipse). Convert to HSV. For each registered color, count how many
-        rim pixels fall within that color's HSV range. The color with the
-        highest count wins, but only if its count exceeds
-        COLOR_DOMINANCE_THR of the total rim pixels.
-
-        This replaces the previous "median hue + bins" classifier with a
-        per-color mask test, which is what filters the hanger arm: the arm
-        is brown/grey/metal, no registered color's mask covers it, so the
-        dominance test fails and the candidate is rejected.
-
-        Note on alignment: depth and RGB are not pixel-aligned on the
-        Gemini without `depth_registration`. The rim annulus is a few
-        pixels thick, which mostly absorbs the parallax (a 5-10 px offset
-        at ~1 m), but expect the dominance ratio to be lower than for a
-        perfectly-aligned setup.
-        """
         h, w = bgr.shape[:2]
 
-        # Build rim-band mask (outer ellipse minus a scaled-down inner
-        # ellipse) in RGB pixel coordinates.
         inner_ell = (
             ellipse[0],
             (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
@@ -1045,7 +586,7 @@ class RingDetector(Node):
         rim_mask = cv2.subtract(mask_outer, mask_inner)
         total = int(np.count_nonzero(rim_mask))
         if total < 20:
-            # Ellipse too small to get a reliable color reading.
+
             return 'unknown'
 
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -1057,7 +598,7 @@ class RingDetector(Node):
             for lo, hi in ranges:
                 color_mask |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8),
                                                np.array(hi, dtype=np.uint8))
-            # Count rim pixels that are also this color.
+
             count = int(np.count_nonzero(cv2.bitwise_and(rim_mask, color_mask)))
             if count > best_count:
                 best_count = count
@@ -1075,19 +616,13 @@ class RingDetector(Node):
 
         return best_color
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 3-D geometry
-    # ──────────────────────────────────────────────────────────────────────
-
     def _backproject(self, u: int, v: int, depth_m: float) -> np.ndarray:
-        """Pinhole back-projection: pixel (u,v) + depth → camera-frame XYZ."""
         X = (u - self.cx_cam) * depth_m / self.fx
         Y = (v - self.cy_cam) * depth_m / self.fy
         return np.array([X, Y, depth_m], dtype=float)
 
     def _to_map(self, point_cam: np.ndarray,
                 frame_id: str, stamp) -> PointStamped | None:
-        """Transform a camera-frame 3-D point to the odom frame via TF2."""
         ps = PointStamped()
         ps.header.frame_id = frame_id
         ps.header.stamp    = stamp
@@ -1095,8 +630,6 @@ class RingDetector(Node):
         ps.point.y = float(point_cam[1])
         ps.point.z = float(point_cam[2])
 
-        # Short timeout: if TF can't resolve quickly, drop this detection rather
-        # than block the executor. Image callbacks must not stall.
         timeout = Duration(seconds=0.02)
 
         try:
@@ -1107,20 +640,15 @@ class RingDetector(Node):
             self.get_logger().debug(f'TF failed: {te}')
             return None
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Tracking
-    # ──────────────────────────────────────────────────────────────────────
-
     @staticmethod
     def _xy_dist(ax, ay, bx, by) -> float:
         return float(np.hypot(ax - bx, ay - by))
 
     def _update_tracking(self, x, y, z, color, now):
-        """Route a new map-frame detection through the pending/confirmed pipeline."""
-        # 1. Try to associate with a confirmed ring
+
         if self._hit_confirmed(x, y, z, color, now):
             return
-        # 2. Otherwise update / create a pending candidate
+
         self._hit_pending(x, y, z, color, now)
 
     def _hit_confirmed(self, x, y, z, color, now) -> bool:
@@ -1135,7 +663,7 @@ class RingDetector(Node):
             return False
 
         ring_id, pt, count, _, votes = self.confirmed[best_i]
-        # Weighted running mean
+
         w   = 1.0 / (count + 1)
         pt.x = pt.x * (1 - w) + x * w
         pt.y = pt.y * (1 - w) + y * w
@@ -1173,7 +701,6 @@ class RingDetector(Node):
                 del self.pending[best_i]
             return
 
-        # Brand-new candidate
         p = Point()
         p.x, p.y, p.z = float(x), float(y), float(z)
         self.pending.append((p, 1, now, {color: 1}))
@@ -1185,7 +712,6 @@ class RingDetector(Node):
         ]
 
     def _merge_confirmed(self):
-        """Merge confirmed rings that ended up too close to each other."""
         if len(self.confirmed) < 2:
             return
         merged = []
@@ -1216,7 +742,6 @@ class RingDetector(Node):
         self.confirmed = merged
 
     def _maybe_log_rejection_summary(self, now):
-        """Log aggregate rejection diagnostics once per second."""
         now_ns = now.nanoseconds
         if now_ns - self._last_rej_log_ns < int(1e9):
             return
@@ -1235,10 +760,6 @@ class RingDetector(Node):
             s[key] = 0
         self._last_rej_log_ns = now_ns
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Publisher
-    # ──────────────────────────────────────────────────────────────────────
-
     def _publish_cb(self):
         msg = RingCoords()
         for ring_id, pt, count, _, votes in self.confirmed:
@@ -1251,10 +772,6 @@ class RingDetector(Node):
             msg.points.append(pt)
             msg.colors.append(best_color)
         self.coord_pub.publish(msg)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Visualisation helper
-    # ──────────────────────────────────────────────────────────────────────
 
     def _depth_to_gray(self, depth_m: np.ndarray) -> np.ndarray:
         d = depth_m.copy()
@@ -1271,9 +788,6 @@ class RingDetector(Node):
         norm[d == 0] = 1.0
         return (norm * 255).astype(np.uint8)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-
 def main():
     rclpy.init(args=None)
     node = RingDetector()
@@ -1285,7 +799,6 @@ def main():
         cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
