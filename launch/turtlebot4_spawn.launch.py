@@ -33,7 +33,8 @@ ARGUMENTS = [
     DeclareLaunchArgument('rviz', default_value='false',choices=['true', 'false'],description='Start rviz.'),
     DeclareLaunchArgument('use_sim_time', default_value='true',choices=['true', 'false'],description='use_sim_time'),
     DeclareLaunchArgument('model', default_value='standard',choices=['standard', 'lite'],description='Turtlebot4 Model'),
-    DeclareLaunchArgument('namespace', default_value='', description='Robot namespace')
+    DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
+    DeclareLaunchArgument('world', default_value='task2_blue_demo', description='World name')
 ]
 
 for pose_element in ['x', 'y', 'z', 'yaw']:
@@ -43,7 +44,7 @@ for pose_element in ['x', 'y', 'z', 'yaw']:
 
 def generate_launch_description():
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory('rins_robot')
+    pkg_rins_robot = get_package_share_directory('rins_robot')
     pkg_turtlebot4_gz_bringup = get_package_share_directory('turtlebot4_gz_bringup')
     pkg_turtlebot4_description = get_package_share_directory('turtlebot4_description')
     pkg_turtlebot4_viz = get_package_share_directory('turtlebot4_viz')
@@ -52,12 +53,12 @@ def generate_launch_description():
     pkg_irobot_create_gz_bringup = get_package_share_directory('irobot_create_gz_bringup')
 
     # Paths
-    turtlebot4_ros_gz_bridge_launch = PathJoinSubstitution([pkg_turtlebot4_gz_bringup, 'launch', 'ros_gz_bridge.launch.py'])
+    turtlebot4_ros_gz_bridge_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'ros_gz_bridge.launch.py'])
     rviz_launch = PathJoinSubstitution([pkg_turtlebot4_viz, 'launch', 'view_navigation.launch.py'])
     turtlebot4_node_launch = PathJoinSubstitution([pkg_turtlebot4_gz_bringup, 'launch', 'turtlebot4_nodes.launch.py'])
-    create3_nodes_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'create3_nodes.launch.py'])
+    create3_nodes_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'create3_nodes.launch.py'])
     create3_gz_nodes_launch = PathJoinSubstitution([pkg_irobot_create_gz_bringup, 'launch', 'create3_gz_nodes.launch.py'])
-    robot_description_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'robot_description.launch.py'])
+    robot_description_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'robot_description.launch.py'])
     dock_description_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'dock_description.launch.py'])
 
     # Parameters
@@ -70,6 +71,7 @@ def generate_launch_description():
     # Launch configurations
     namespace = LaunchConfiguration('namespace')
     use_sim_time = LaunchConfiguration('use_sim_time')
+    world = LaunchConfiguration('world')
     x, y, z = LaunchConfiguration('x'), LaunchConfiguration('y'), LaunchConfiguration('z')
     yaw = LaunchConfiguration('yaw')
     turtlebot4_node_yaml_file = LaunchConfiguration('param_file')
@@ -108,7 +110,8 @@ def generate_launch_description():
             launch_arguments=[
                 ('model', LaunchConfiguration('model')),
                 ('robot_name', robot_name),
-                ('namespace', namespace)
+                ('namespace', namespace),
+                ('world', world)
             ]
         ),
 
@@ -171,6 +174,25 @@ def generate_launch_description():
                 ('/tf_static', 'tf_static'),
             ]
         ),
+
+        # Top camera static transform
+        # Required for pointcloud. See https://github.com/gazebosim/gz-sensors/issues/239
+        Node(
+            name='top_camera_stf',
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            output='screen',
+            arguments=[
+                '0', '0', '0',
+                '1.5707', '-1.5707', '0',
+                'top_camera_rgb_camera_optical_frame',
+                [robot_name, '/top_camera_rgb_camera_frame/rgbd_camera']
+            ],
+            remappings=[
+                ('/tf', 'tf'),
+                ('/tf_static', 'tf_static'),
+            ]
+        ),
     ])
 
     laser_filter = Node(
@@ -178,7 +200,7 @@ def generate_launch_description():
         executable="scan_to_scan_filter_chain",
         parameters=[
             PathJoinSubstitution([
-                pkg_dis_tutorial3,
+                pkg_rins_robot,
                 "config",
                 "laser_filter_chain.yaml",
             ])

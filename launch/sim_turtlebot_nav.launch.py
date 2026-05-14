@@ -62,7 +62,8 @@ def generate_launch_description():
             ('y', LaunchConfiguration('y')),
             ('z', LaunchConfiguration('z')),
             ('yaw', LaunchConfiguration('yaw')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time'))
+            ('use_sim_time', LaunchConfiguration('use_sim_time')),
+            ('world', LaunchConfiguration('world'))
         ]
     )
     

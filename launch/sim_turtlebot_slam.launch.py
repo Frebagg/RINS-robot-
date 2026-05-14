@@ -35,12 +35,12 @@ for pose_element in ['x', 'y', 'z', 'yaw']:
 
 def generate_launch_description():
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory('rins_robot')
+    pkg_rins_robot = get_package_share_directory('rins_robot')
     
     # Launch Files
-    gazebo_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'sim.launch.py'])
-    robot_spawn_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'turtlebot4_spawn.launch.py'])
-    slam_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'slam.launch.py'])
+    gazebo_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'sim.launch.py'])
+    robot_spawn_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'turtlebot4_spawn.launch.py'])
+    slam_launch = PathJoinSubstitution([pkg_rins_robot, 'launch', 'slam.launch.py'])
 
     #Simulator and world
     gazebo = IncludeLaunchDescription(
@@ -61,7 +61,8 @@ def generate_launch_description():
             ('y', LaunchConfiguration('y')),
             ('z', LaunchConfiguration('z')),
             ('yaw', LaunchConfiguration('yaw')),
-            ('use_sim_time', LaunchConfiguration('use_sim_time'))
+            ('use_sim_time', LaunchConfiguration('use_sim_time')),
+            ('world', LaunchConfiguration('world'))
         ]
     )
 

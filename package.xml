@@ -3,7 +3,7 @@
 <package format="3">
   <name>rins_robot</name>
   <version>0.0.0</version>
-  <description>RINS robot package merged with dis_tutorial3 simulation assets, worlds, launch files and helper scripts.</description>
+  <description>RINS robot package with TurtleBot4 simulation assets, Task 2 worlds, launch files and arm support.</description>
   <maintainer email="sever@todo.todo">sever</maintainer>
   <license>TODO</license>
 
@@ -21,6 +21,13 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>diff_drive_controller</exec_depend>
+  <exec_depend>gz_ros2_control</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
