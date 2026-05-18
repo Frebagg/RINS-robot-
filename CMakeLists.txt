@@ -27,7 +27,7 @@ install(DIRECTORY
 
 install(PROGRAMS
   src/face_detection.py
-  src/detect_rings.py
+  src/ring_detector.py
   src/visualiser.py
   src/speech_servicer.py
   src/robot_commander.py
