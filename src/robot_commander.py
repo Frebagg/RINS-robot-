@@ -38,7 +38,7 @@ from rclpy.qos import qos_profile_sensor_data
 #ZA DRUGI KROG
 from rins_robot.msg import FaceCoords
 from rins_robot.msg import RingCoords
-from std_msgs import String
+from std_msgs.msg import String
 #from rins_robot.srv import Speech
 import numpy as np
 
